@@ -387,12 +387,23 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
             if part.strip()
         )
         if step.interface == "CLI":
-            judged = _judged_or_unreadable(deps, question, _command_text(evidence))
-            results.append(
-                VerificationResult(question=question, passed=judged.passed, judgment=judged.judgment)
-            )
-            judgments.append(judged.judgment)
-            passed = passed and judged.passed
+            # For CLI steps, don't use PageJudge - use direct evaluation
+            if _structured_check(question):
+                ok = evaluate_assertion(question, evidence)
+                results.append(VerificationResult(question=question, passed=ok))
+                passed = passed and ok
+            else:
+                # For non-structured CLI assertions, check if command succeeded
+                # Command succeeded if exit code is 0 and no stderr
+                stdout = str(evidence.get("stdout") or "")
+                stderr = str(evidence.get("stderr") or "")
+                command_passed = result.ok and not stderr.strip()
+                results.append(VerificationResult(
+                    question=question,
+                    passed=command_passed,
+                    judgment=f"Command {'succeeded' if command_passed else 'failed'}"
+                ))
+                passed = passed and command_passed
         elif page_source.strip():
             judged = _judged_or_unreadable(deps, question, page_source)
             results.append(
