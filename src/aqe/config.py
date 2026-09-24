@@ -33,6 +33,7 @@ class EngineConfig(BaseModel):
     sandbox_image: str = "aqe-sandbox:local"
     sandbox_timeout_seconds: int = 30
     sandbox_output_limit: int = 64 * 1024
+    pi_llm_model: str | None = None
 
     @property
     def llm_configured(self) -> bool:
@@ -75,6 +76,7 @@ class EngineConfig(BaseModel):
             "max_retries": settings.max_retries,
             "spec_max_bytes": settings.spec_max_bytes,
             "runs_dir": settings.runs_dir,
+            "pi_llm_model": settings.pi_llm_model if hasattr(settings, 'pi_llm_model') else None,
         }
         values.update(overrides)
         return cls.model_validate(values)

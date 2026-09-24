@@ -20,16 +20,19 @@ class HostCapabilities(BaseModel):
     browser: CapabilityFlag
     desktop: CapabilityFlag
     sandbox: CapabilityFlag
+    coding: CapabilityFlag
 
     def as_public(self) -> dict[str, object]:
         return {
             "browser": self.browser.available,
             "desktop": self.desktop.available,
             "sandbox": self.sandbox.available,
+            "coding": self.coding.available,
             "detail": {
                 "browser": self.browser.detail,
                 "desktop": self.desktop.detail,
                 "sandbox": self.sandbox.detail,
+                "coding": self.coding.detail,
             },
         }
 
@@ -117,6 +120,58 @@ def _probe_sandbox(image: str) -> CapabilityFlag:
     return CapabilityFlag(available=True, detail=None)
 
 
+def _probe_coding(config: EngineConfig | None = None) -> CapabilityFlag:
+    if shutil.which("pi") is None:
+        return CapabilityFlag(
+            available=False,
+            detail="Pi coding agent is not installed.",
+        )
+    try:
+        version = subprocess.run(
+            ["pi", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CapabilityFlag(
+            available=False,
+            detail=f"Pi coding agent is not available. {exc}",
+        )
+    if version.returncode != 0:
+        detail = (version.stderr or version.stdout or "pi --version failed").strip()
+        return CapabilityFlag(
+            available=False,
+            detail=f"Pi coding agent is not working properly. {detail}",
+        )
+
+    # Check if Pi has access to the specified LLM model
+    if config and config.pi_llm_model:
+        try:
+            # Try to check if Pi can access the specified model
+            # This is a simplified check - in production you might want to use Pi's API
+            model_check = subprocess.run(
+                ["pi", "--model-check", config.pi_llm_model],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            # If the command doesn't exist or fails, we'll assume Pi can use the model
+            # In a real implementation, you'd want to check the actual model availability
+            if model_check.returncode != 0 and "model not found" in model_check.stderr.lower():
+                return CapabilityFlag(
+                    available=False,
+                    detail=f"Pi coding agent does not have access to model: {config.pi_llm_model}",
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            # If the model check command doesn't exist, we'll proceed
+            pass
+
+    return CapabilityFlag(available=True, detail=None)
+
+
 def probe_host(config: EngineConfig | None = None) -> HostCapabilities:
     """Probe the machine. Imports of optional drivers stay inside this function."""
     image = config.sandbox_image if config else "aqe-sandbox:local"
@@ -124,6 +179,7 @@ def probe_host(config: EngineConfig | None = None) -> HostCapabilities:
         browser=_probe_browser(),
         desktop=_probe_desktop(),
         sandbox=_probe_sandbox(image),
+        coding=_probe_coding(config),
     )
 
 
@@ -132,6 +188,7 @@ def unavailable_capabilities() -> HostCapabilities:
         browser=CapabilityFlag(available=False, detail="browser forced unavailable"),
         desktop=CapabilityFlag(available=False, detail="desktop forced unavailable"),
         sandbox=CapabilityFlag(available=False, detail="sandbox forced unavailable"),
+        coding=CapabilityFlag(available=False, detail="coding forced unavailable"),
     )
 
 
@@ -149,6 +206,8 @@ def required_capabilities(steps: list[dict[str, object]], *, llm: str, llm_confi
             needed.append("desktop")
         elif interface == "CLI":
             needed.append("sandbox")
+        elif interface == "CODING":
+            needed.append("coding")
     if not llm_configured:
         needed.append("llm")
     unique: list[str] = []
@@ -164,6 +223,7 @@ def missing_details(capabilities: HostCapabilities, names: list[str]) -> list[st
         "browser": capabilities.browser,
         "desktop": capabilities.desktop,
         "sandbox": capabilities.sandbox,
+        "coding": capabilities.coding,
     }
     for name in names:
         if name == "llm":

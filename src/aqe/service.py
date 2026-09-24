@@ -13,6 +13,7 @@ from typing import Any
 from aqe.capabilities import Probe, probe_host
 from aqe.cli_runtime.sandbox import build_sandbox
 from aqe.cli_runtime.synthesizer import CLISubsystem
+from aqe.coding_agent.subsystem import CodingSubsystem, build_coding_agent
 from aqe.config import EngineConfig
 from aqe.errors import SpecValidationError
 from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
@@ -45,6 +46,7 @@ class RunService:
         planner: Planner | None = None,
         gui: GUISubsystem | None = None,
         sandbox: Any | None = None,
+        coding: CodingSubsystem | None = None,
         judge: PageJudge | None = None,
         probe: Probe | None = None,
         pause: threading.Event | None = None,
@@ -54,6 +56,7 @@ class RunService:
         self.planner = planner
         self.gui = gui
         self.sandbox = sandbox
+        self.coding = coding
         self.judge = judge
         self.probe = probe or (lambda: probe_host(self.config))
         self.pause = pause
@@ -157,11 +160,14 @@ class RunService:
             record.execution_history = list(state.get("execution_history") or [])
             self._remember(record)
 
+        gui = None
+        coding = None
         try:
             config = self.config
             planner = self.planner or build_planner(config)
             gui = self.gui or build_gui(config)
             sandbox = self.sandbox or build_sandbox(config)
+            coding = self.coding or build_coding_agent(config.runs_dir, config.pi_llm_model)
             evidence = self.run_dir(run_id) / "evidence"
             evidence.mkdir(parents=True, exist_ok=True)
             deps = GraphDeps(
@@ -169,6 +175,7 @@ class RunService:
                 planner=planner,
                 gui=gui,
                 cli=CLISubsystem(planner, sandbox),
+                coding=coding,
                 control=record.control,
                 probe=self.probe,
                 evidence_dir_for=lambda _run_id: str(evidence),
@@ -192,9 +199,20 @@ class RunService:
             self._write_report(record)
             self._remember(record)
         finally:
-            closer = getattr(gui, "close", None)
-            if closer:
-                closer()
+            try:
+                if gui is not None:
+                    closer = getattr(gui, "close", None)
+                    if closer:
+                        closer()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if coding is not None:
+                    coding_closer = getattr(coding, "close", None)
+                    if coding_closer:
+                        coding_closer()
+            except Exception:  # noqa: BLE001
+                pass
             if not record.ready:
                 record.ready = True
                 record.status = record.status if record.status in TERMINAL_STATUSES else "failed"

@@ -4,7 +4,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
-Interface = Literal["GUI", "CLI"]
+Interface = Literal["GUI", "CLI", "CODING"]
 GuiDriverName = Literal["browser", "desktop"]
 StepStatus = Literal[
     "pending",
@@ -34,6 +34,8 @@ ReasonCode = Literal[
     "not_a_test_plan",
     "missing_capability",
     "canceled",
+    "coding_agent_failed",
+    "coding_agent_not_available",
 ]
 
 
@@ -44,6 +46,15 @@ class GUIAction(BaseModel):
     coordinate: list[int] | None = None
     selector: dict[str, str] | None = None
     text: str | None = None
+
+
+class CodingAction(BaseModel):
+    """One coding operation for the Pi coding agent."""
+
+    action: Literal["create_file", "update_file", "review_code", "execute_code"]
+    file_path: str | None = None
+    content: str | None = None
+    description: str | None = None
 
 
 class TestPhase(BaseModel):
@@ -57,6 +68,14 @@ class TestPhase(BaseModel):
     operations: list[GUIAction] = Field(default_factory=list)
     operation_notes: list[str] = Field(default_factory=list)
     verifications: list[str] = Field(default_factory=list)
+    coding_operations: list[CodingAction] = Field(default_factory=list)
+
+    def validate_shape(self) -> str | None:
+        if self.interface == "CODING" and self.gui_driver is not None:
+            return f"phase {self.phase} is a CODING phase with a gui_driver"
+        if self.interface == "CODING" and not self.coding_operations:
+            return f"phase {self.phase} is a CODING phase with no coding operations"
+        return None
 
 
 class TestStep(BaseModel):
@@ -73,6 +92,7 @@ class TestStep(BaseModel):
     depends_on: list[int] = Field(default_factory=list)
     operation_notes: list[str] = Field(default_factory=list)
     verifications: list[str] = Field(default_factory=list)
+    coding_operations: list[CodingAction] = Field(default_factory=list)
 
     def validate_shape(self) -> str | None:
         if not self.action.strip():
@@ -83,6 +103,10 @@ class TestStep(BaseModel):
             return f"step {self.step} is a GUI step with no gui_driver"
         if self.interface == "CLI" and self.gui_driver is not None:
             return f"step {self.step} is a CLI step with a gui_driver"
+        if self.interface == "CODING" and self.gui_driver is not None:
+            return f"step {self.step} is a CODING step with a gui_driver"
+        if self.interface == "CODING" and not self.coding_operations:
+            return f"step {self.step} is a CODING step with no coding operations"
         return None
 
 
@@ -128,6 +152,7 @@ class StepView(BaseModel):
     depends_on: list[int] = Field(default_factory=list)
     operation_notes: list[str] = Field(default_factory=list)
     verification_results: list[VerificationResult] = Field(default_factory=list)
+    coding_operations: list[CodingAction] = Field(default_factory=list)
 
     @classmethod
     def from_step(cls, step: TestStep, status: StepStatus = "pending") -> "StepView":
@@ -135,7 +160,7 @@ class StepView(BaseModel):
         return cls(
             step=step.step,
             interface=step.interface,
-            gui_driver=step.gui_driver,
+            gui_driver=step.gui_driver if step.interface != "CODING" else None,
             action=step.action,
             assertion=step.assertion,
             status=status,
@@ -144,6 +169,7 @@ class StepView(BaseModel):
             depends_on=list(step.depends_on),
             operation_notes=list(step.operation_notes),
             verification_results=[VerificationResult(question=question) for question in questions],
+            coding_operations=list(step.coding_operations),
         )
 
 

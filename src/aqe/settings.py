@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     sut_port: int = 8765
     host: str = "127.0.0.1"
     port: int = 8000
+    pi_llm_model: str | None = None
 
     @field_validator(
         "openai_api_key",
@@ -51,6 +52,7 @@ class Settings(BaseSettings):
         "anthropic_api_key",
         "ollama_base_url",
         "spec_path",
+        "pi_llm_model",
         mode="before",
     )
     @classmethod

@@ -14,6 +14,7 @@ from aqe.capabilities import (
 )
 from aqe.cli_runtime.synthesizer import CLISubsystem
 from aqe.config import EngineConfig
+from aqe.coding_agent.subsystem import CodingSubsystem
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
 from aqe.judge import PageJudge, build_judge
@@ -40,6 +41,7 @@ class GraphDeps:
     planner: Planner
     gui: GUISubsystem
     cli: CLISubsystem
+    coding: CodingSubsystem
     control: RunControl
     probe: Probe
     evidence_dir_for: Callable[[str], str]
@@ -147,7 +149,13 @@ def route_node(state: AgentState, deps: GraphDeps) -> dict:
         return {"phase": "finish", "reason_code": None, "reason": None}
     views = _views(state)
     _set_status(views, index, "running", summary=None)
-    phase = "execute_gui" if matrix[index].interface == "GUI" else "execute_cli"
+    step = matrix[index]
+    if step.interface == "GUI":
+        phase = "execute_gui"
+    elif step.interface == "CODING":
+        phase = "execute_coding"
+    else:  # CLI
+        phase = "execute_cli"
     return {"phase": phase, "step_views": _store_views(views)}
 
 
@@ -161,8 +169,10 @@ def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
     try:
         if kind == "gui":
             result = deps.gui.execute_visual_action(step, evidence_dir)
-        else:
+        elif kind == "cli":
             result = deps.cli.execute_runtime_action(step, evidence_dir)
+        else:  # coding
+            result = deps.coding.execute_coding_action(step, evidence_dir)
     except HarnessError as exc:
         return _error_update(state, index, exc.code, str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -176,6 +186,10 @@ def execute_gui_node(state: AgentState, deps: GraphDeps) -> dict:
 
 def execute_cli_node(state: AgentState, deps: GraphDeps) -> dict:
     return _execute(state, deps, "cli")
+
+
+def execute_coding_node(state: AgentState, deps: GraphDeps) -> dict:
+    return _execute(state, deps, "coding")
 
 
 def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
@@ -360,6 +374,8 @@ def finish_node(state: AgentState, deps: GraphDeps) -> dict:
         "desktop_input_failed",
         "driver_timeout",
         "engine_error",
+        "coding_agent_failed",
+        "coding_agent_not_available",
     }:
         verdict = "error"
     elif any(view.status == "error" for view in views):
@@ -409,11 +425,12 @@ def build_graph(deps: GraphDeps, publish: Callable[[AgentState], None] | None = 
     graph.add_node("route", bind(route_node))
     graph.add_node("execute_gui", bind(execute_gui_node))
     graph.add_node("execute_cli", bind(execute_cli_node))
+    graph.add_node("execute_coding", bind(execute_coding_node))
     graph.add_node("validate", bind(validate_node))
     graph.add_node("reflect", bind(reflect_node))
     graph.add_node("finish", bind(finish_node))
     graph.set_entry_point("plan")
-    for name in ("plan", "preflight", "route", "execute_gui", "execute_cli", "validate", "reflect", "finish"):
+    for name in ("plan", "preflight", "route", "execute_gui", "execute_cli", "execute_coding", "validate", "reflect", "finish"):
         graph.add_conditional_edges(name, _route)
     return graph.compile()
 

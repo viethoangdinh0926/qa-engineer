@@ -29,7 +29,7 @@ async function loadCapabilities() {
   const response = await fetch("/v1/capabilities");
   const data = await response.json();
   chips.replaceChildren();
-  for (const name of ["browser", "desktop", "sandbox"]) {
+  for (const name of ["browser", "desktop", "sandbox", "coding"]) {
     const chip = document.createElement("span");
     chip.className = data[name] ? "chip" : "chip off";
     const detail = data.detail && data.detail[name] ? ` — ${data.detail[name]}` : "";
@@ -96,7 +96,13 @@ function stepDetails(step, detailed) {
   const item = document.createElement("li");
   const tag = document.createElement("div");
   tag.className = "tag";
-  tag.textContent = step.interface === "GUI" ? `GUI ${step.gui_driver || ""}`.trim() : "CLI";
+  if (step.interface === "GUI") {
+    tag.textContent = `GUI ${step.gui_driver || ""}`.trim();
+  } else if (step.interface === "CODING") {
+    tag.textContent = "CODING";
+  } else {
+    tag.textContent = "CLI";
+  }
   const body = document.createElement("div");
   const action = document.createElement("p");
   action.className = "action";

@@ -10,12 +10,12 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from aqe.config import EngineConfig
-from aqe.state import GUIAction, PlanResult, TestPhase, TestStep
+from aqe.state import CodingAction, GUIAction, PlanResult, TestPhase, TestStep
 
 NONSENSE_SPEC = "Hello, this is not a test specification."
 
 _STEP_LINE = re.compile(
-    r"^(?:(\d+)\.\s*)?(GUI|CLI)(?:\s+(browser|desktop))?\s*:\s*(.+?)\s*$",
+    r"^(?:(\d+)\.\s*)?(GUI|CLI|CODING)(?:\s+(browser|desktop))?\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
 )
 _ASSERTION_LINE = re.compile(r"^assertion\s*:\s*(.+)$", re.IGNORECASE)
@@ -60,7 +60,7 @@ def _parse_labeled_steps(specification: str) -> list[TestStep]:
         driver = (match.group(3) or "").lower() or None
         if interface == "GUI" and driver is None:
             driver = "browser"
-        if interface == "CLI":
+        if interface in {"CLI", "CODING"}:
             driver = None
         pending = {
             "step": number,
@@ -75,7 +75,7 @@ def _parse_labeled_steps(specification: str) -> list[TestStep]:
 
 def _validate_steps(steps: list[TestStep]) -> str | None:
     if not steps:
-        return "no verifiable GUI or CLI actions were found"
+        return "no verifiable GUI, CLI, or CODING actions were found"
     seen: set[int] = set()
     for step in steps:
         problem = step.validate_shape()
@@ -97,16 +97,19 @@ class Planner(Protocol):
 
 _PLAN_SYSTEM = (
     "You are the planner, not the executor. Another system will run the phases you write: "
-    "GUI phases in a browser, CLI phases in a sandbox. "
-    "Do not reject a request because you cannot click, browse, or read files yourself. "
+    "GUI phases in a browser, CLI phases in a sandbox, CODING phases through a Pi coding agent. "
+    "Do not reject a request because you cannot click, browse, read files, or write code yourself. "
     "Turn the testing request into one linear pipeline of testing phases. "
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Each phase is a chain of operations followed by the verifications of those operations. "
     "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
-    "interface (GUI or CLI), gui_driver (browser, desktop, or null), operations, and verifications. "
+    "interface (GUI, CLI, or CODING), gui_driver (browser, desktop, or null), operations, and verifications. "
     "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
     "CLI operations are strings. "
+    "CODING operations are objects with action create_file, update_file, review_code, or execute_code, "
+    "plus file_path, content, and description when needed. "
     "GUI verifications are questions about the page after the operations. "
+    "CLI and CODING verifications are questions about the command output or file state. "
     "Write every verification as one or two complete sentences. Be specific and verbose. "
     "Keep the original meaning of the user's check. Do not add a condition they did not ask for, and do not drop one they did. "
     "Do not shorten a check into contains:, json:, or status:. "
@@ -117,6 +120,9 @@ _PLAN_SYSTEM = (
     "'The ls command returns nothing. stdout is empty. A successful exit code does not satisfy this check.' "
     "Example: 'Run curl and verify that it reports an error.' has verification "
     "'The curl command reports an error.' It does not mention stdout. "
+    "For coding operations, detect requests like 'create a file', 'update code', 'review the code', 'execute the script'. "
+    "Example: 'Create a file test.py with a hello world function' becomes a CODING phase with "
+    "coding_operations: [{'action': 'create_file', 'file_path': 'test.py', 'content': 'def hello(): print(\"world\")'}]. "
     "Put a phase that needs another phase's result after that phase, and list it in depends_on. "
     "One page visit is one GUI phase. Navigation, typing, and the click are that phase's operations. "
     "The page check is a verification on that same phase, not a later phase. "
@@ -138,7 +144,7 @@ _PLAN_SYSTEM = (
 
 _REPAIR_SYSTEM = (
     "Revise the testing plan. Reply with one JSON object only, with keys accepted, reason, and phases. "
-    "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, and verifications. "
+    "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, coding_operations, and verifications. "
     "verifications must be strings. "
     "Every check the request asks for must appear as a verification written as one or two complete sentences. "
     "Be verbose and keep the original meaning. Do not shorten a check into contains:, json:, or status:. "
@@ -147,8 +153,9 @@ _REPAIR_SYSTEM = (
     "Mention stderr only when the user mentions an error, issue, exception, warning, failure, traceback, or stderr. "
     "A page check belongs on the GUI phase whose operations produce that page. Never make the check its own phase. "
     "A file, webhook, or command check is a later CLI phase whose depends_on lists the phase that produced it. "
+    "Coding operations (create_file, update_file, review_code, execute_code) belong in CODING phases. "
     "Keep phases in an order that respects those dependencies. "
-    "You are the planner, not the executor. Do not reject a request because you cannot browse or read files. "
+    "You are the planner, not the executor. Do not reject a request because you cannot browse, read files, or write code. "
     "Opening a page, typing into a named field, clicking a named button, and checking the resulting page "
     "is one accepted GUI phase. Use those names in the selectors. "
     "Set accepted false only when the request itself is not a test or contradicts itself."
@@ -282,6 +289,10 @@ def _missing_operations(steps: list[TestStep]) -> str | None:
     for step in steps:
         if step.interface == "GUI" and not step.operations:
             return f"step {step.step} has no GUI operations"
+        if step.interface == "CODING" and not step.coding_operations:
+            return f"step {step.step} has no coding operations"
+        if step.interface == "CLI" and not step.operation_notes:
+            return f"step {step.step} has no CLI operations"
     return None
 
 
@@ -447,25 +458,46 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
         interface = str(item.get("interface") or "").strip().upper()
         driver = item.get("gui_driver")
         driver_name = str(driver).strip().lower() if isinstance(driver, str) and driver.strip() else None
-        if interface not in {"GUI", "CLI"}:
-            if driver_name in {"browser", "desktop"} or actions:
+
+        # Handle coding operations
+        coding_operations_raw = item.get("coding_operations") or []
+        coding_operations = []
+        if isinstance(coding_operations_raw, list):
+            for op in coding_operations_raw:
+                if isinstance(op, dict):
+                    try:
+                        coding_operations.append(CodingAction.model_validate(op))
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # Auto-detect interface if not specified
+        if interface not in {"GUI", "CLI", "CODING"}:
+            if coding_operations:
+                interface = "CODING"
+            elif driver_name in {"browser", "desktop"} or actions:
                 interface = "GUI"
             elif any(check.startswith(("json:", "status:")) for check in verifications):
                 interface = "CLI"
             else:
                 problems.append(
-                    f"Phase {number} ({name}) does not say whether its operations run through the GUI or the CLI. "
+                    f"Phase {number} ({name}) does not say whether its operations run through the GUI, CLI, or CODING. "
                     "The pipeline cannot place that phase because the driver is unknown."
                 )
                 continue
+
         if interface == "GUI" and driver_name not in {"browser", "desktop"}:
             driver_name = "browser"
-        if interface == "CLI":
+        if interface in {"CLI", "CODING"}:
             driver_name = None
         if interface == "CLI" and not verifications and notes:
             verifications = list(notes)
         if interface == "CLI" and verifications and not notes and not actions:
             notes = [f"Carry out: {item}" for item in verifications]
+        if interface == "CODING" and not verifications and notes:
+            verifications = list(notes)
+        if interface == "CODING" and verifications and not notes and not coding_operations:
+            notes = [f"Carry out: {item}" for item in verifications]
+
         phases.append(
             TestPhase(
                 phase=number,
@@ -476,6 +508,7 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
                 operations=[GUIAction.model_validate(action) for action in actions],
                 operation_notes=notes,
                 verifications=verifications,
+                coding_operations=coding_operations,
             )
         )
     if problems:
@@ -590,7 +623,7 @@ def verbalize_verifications(specification: str, phases: list[TestPhase]) -> list
 
 
 def _has_work(phase: TestPhase) -> bool:
-    return bool(phase.operations or phase.operation_notes)
+    return bool(phase.operations or phase.operation_notes or phase.coding_operations)
 
 
 def fold_check_phases(phases: list[TestPhase]) -> list[TestPhase]:
@@ -650,7 +683,8 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
     problems: list[str] = []
     for phase in phases:
         label = f"Phase {phase.phase} ({phase.name})"
-        if not phase.operation_notes and not phase.operations:
+        has_operations = bool(phase.operation_notes or phase.operations or phase.coding_operations)
+        if not has_operations:
             questions = "; ".join(phase.verifications) or "the listed checks"
             problems.append(
                 f"{label} has verifications but no operations. "
@@ -738,6 +772,8 @@ def _phase_to_step(phase: TestPhase) -> TestStep:
     checks = list(phase.verifications)
     if phase.interface == "CLI":
         action = ". ".join(notes) if notes else phase.name
+    elif phase.interface == "CODING":
+        action = ". ".join(notes) if notes else phase.name
     else:
         action = phase.name or ". ".join(notes)
     assertion = checks[0] if len(checks) == 1 else "\n".join(checks)
@@ -753,6 +789,7 @@ def _phase_to_step(phase: TestPhase) -> TestStep:
         depends_on=list(phase.depends_on),
         operation_notes=notes,
         verifications=checks,
+        coding_operations=list(phase.coding_operations),
     )
 
 
