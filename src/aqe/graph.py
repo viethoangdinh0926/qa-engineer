@@ -14,7 +14,7 @@ from aqe.capabilities import (
 )
 from aqe.cli_runtime.synthesizer import CLISubsystem
 from aqe.config import EngineConfig
-from aqe.coding_agent.subsystem import CodingSubsystem
+from aqe.coding_agent.subsystem import CodingSubsystem, PiAgentError
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
 from aqe.judge import PageJudge, build_judge
@@ -175,8 +175,12 @@ def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
             result = deps.coding.execute_coding_action(step, evidence_dir)
     except HarnessError as exc:
         return _error_update(state, index, exc.code, str(exc))
+    except PiAgentError as exc:
+        return _error_update(state, index, exc.code, str(exc))
     except Exception as exc:  # noqa: BLE001
-        return _error_update(state, index, "engine_error", str(exc))
+        import traceback
+        error_msg = f"{type(exc).__name__}: {str(exc)}\n{traceback.format_exc()}"
+        return _error_update(state, index, "engine_error", error_msg)
     return {"phase": "validate", "last_result": result.model_dump()}
 
 

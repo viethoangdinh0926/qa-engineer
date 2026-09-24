@@ -122,6 +122,20 @@ function stepDetails(step, detailed) {
     operations.textContent = step.operation_notes.map((note, index) => `${index + 1}. ${note}`).join("\n");
     body.append(operations);
   }
+  // Show coding operations for CODING steps
+  if (step.interface === "CODING" && step.coding_operations && step.coding_operations.length) {
+    const codingOps = document.createElement("p");
+    codingOps.className = "summary";
+    const opText = step.coding_operations.map((op, index) => {
+      const opStr = `${index + 1}. ${op.action}`;
+      if (op.file_path) {
+        return `${opStr}: ${op.file_path}`;
+      }
+      return opStr;
+    }).join("\n");
+    codingOps.textContent = opText;
+    body.append(codingOps);
+  }
   const checks = step.verification_results || [];
   if (checks.length) {
     checks.forEach((check) => {

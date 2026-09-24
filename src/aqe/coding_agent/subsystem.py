@@ -230,6 +230,14 @@ class CodingSubsystem:
                     "error": str(exc),
                     "action": operation.action,
                 })
+            except Exception as exc:  # noqa: BLE001
+                # Catch any unexpected errors to prevent engine_error
+                errors.append(f"Unexpected error: {exc}")
+                results.append({
+                    "success": False,
+                    "error": str(exc),
+                    "action": operation.action,
+                })
 
         # Note: Pi agent cleanup not needed for simplified implementation
         # self._stop_pi_agent()
