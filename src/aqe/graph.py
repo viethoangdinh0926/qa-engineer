@@ -120,6 +120,7 @@ def preflight_node(state: AgentState, deps: GraphDeps) -> dict:
         "browser": capabilities.browser.available,
         "desktop": capabilities.desktop.available,
         "sandbox": capabilities.sandbox.available,
+        "coding": capabilities.coding.available,
         "llm": deps.config.llm_configured,
     }
     for name in needed:
