@@ -125,6 +125,7 @@ _PLAN_SYSTEM = (
     "coding_operations: [{'action': 'create_file', 'file_path': 'test.py', 'content': 'def hello(): print(\"world\")'}]. "
     "Some phases may be setup or preparation steps without explicit verifications. "
     "These are still important - if they fail, the entire test fails. "
+    "If all phases have no verifications, the test passes if all operations succeed. "
     "For setup steps like 'Create a directory' or 'Install dependencies', include the operation but no verification. "
     "The system will still check that the operation succeeded. "
     "Put a phase that needs another phase's result after that phase, and list it in depends_on. "
@@ -162,7 +163,9 @@ _REPAIR_SYSTEM = (
     "You are the planner, not the executor. Do not reject a request because you cannot browse, read files, or write code. "
     "Opening a page, typing into a named field, clicking a named button, and checking the resulting page "
     "is one accepted GUI phase. Use those names in the selectors. "
-    "Set accepted false only when the request itself is not a test or contradicts itself."
+    "Set accepted false only when the request itself is not a test or contradicts itself. "
+    "Phases without verifications are allowed for setup/preparation steps. "
+    "If all phases have no verifications, the test passes if all operations succeed."
 )
 
 _REJECT_SYSTEM = (
@@ -682,20 +685,19 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
     if not phases:
         return (
             "The plan has no testing phases. A request needs a pipeline of phases, "
-            "and each phase needs operations to carry out and verifications to run after those operations."
+            "and each phase needs operations to carry out."
         )
     problems: list[str] = []
     for phase in phases:
         label = f"Phase {phase.phase} ({phase.name})"
         has_operations = bool(phase.operation_notes or phase.operations or phase.coding_operations)
         if not has_operations:
-            questions = "; ".join(phase.verifications) or "the listed checks"
             problems.append(
-                f"{label} has verifications but no operations. "
-                f"A phase has to carry out a chain of operations before it can evaluate {questions}."
+                f"{label} has no operations. "
+                f"A phase has to carry out a chain of operations to be actionable."
             )
         # Phases without verifications are now allowed (setup/preparation steps)
-        # They will still fail the test if the operations fail
+        # The test passes if all operations succeed, even without assertions
     if not problems:
         return None
     return "\n".join(problems)

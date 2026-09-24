@@ -257,15 +257,33 @@ The CODING interface supports the following operations through the Pi agent:
 - **review_code**: Analyze and review code files
 - **execute_code**: Run Python scripts and capture output
 
-#### Non-Testing Steps
+#### Non-Testing Steps and Operations-Only Plans
 
-Steps can now be defined without explicit assertions for setup or preparation operations. These are still critical to the test:
+Steps can be defined without explicit assertions for setup or preparation operations. Additionally, entire test plans can consist of operations without any assertions:
 
 - **Setup Steps**: Operations like "Create a directory" or "Install dependencies" that don't need verification
-- **Failure Impact**: If a non-testing step fails, the entire test fails
+- **Operations-Only Plans**: Test plans with no assertions at all - the test passes if all operations succeed
+- **Failure Impact**: If any operation fails (setup or otherwise), the entire test fails
 - **Validation**: Success is determined by whether the operation completed successfully (ActionResult.ok)
 
-#### Example Specification
+#### Example Specification (Operations Only)
+
+```markdown
+1. CODING: Create a project directory structure
+
+2. CODING: Create a Python test file with a hello world function
+
+3. CODING: Update the test file to add a main function
+
+4. CODING: Create a requirements.txt file with dependencies
+```
+
+In this example:
+- All steps are operations without assertions
+- The test passes if all file operations succeed
+- If any operation fails, the test fails immediately
+
+#### Example Specification (Mixed Setup and Testing)
 
 ```markdown
 1. CODING: Create a project directory structure
@@ -274,16 +292,13 @@ Steps can now be defined without explicit assertions for setup or preparation op
 2. CODING: Create a Python test file with a hello world function
    Assertion: File created successfully
 
-3. CODING: Update the test file to add a main function
-   Assertion: File updated with main function
-
-4. CLI: Run the test file
+3. CLI: Run the test file
    Assertion: Output contains 'hello world'
 ```
 
 In this example:
-- Step 1 is a setup step without an assertion - if directory creation fails, the test fails
-- Steps 2-4 are testing steps with explicit assertions
+- Step 1 is a setup step - if directory creation fails, the test fails
+- Steps 2-3 are testing steps with explicit assertions
 - All steps must succeed for the overall test to pass
 
 #### Pi Agent Requirements

@@ -442,6 +442,10 @@ def finish_node(state: AgentState, deps: GraphDeps) -> dict:
     elif views and all(view.assertion_passed is True for view in views):
         verdict = "pass"
         reason_code = None
+    elif views and all(view.status == "passed" for view in views):
+        # All operations succeeded even without assertions
+        verdict = "pass"
+        reason_code = None
     elif not views and reason_code is None:
         verdict = "rejected"
         reason_code = "not_a_test_plan"
