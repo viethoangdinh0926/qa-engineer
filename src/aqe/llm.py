@@ -103,13 +103,17 @@ _PLAN_SYSTEM = (
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Each phase is a chain of operations followed by the verifications of those operations. "
     "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
-    "interface (GUI, CLI, or CODING), gui_driver (browser, desktop, or null), operations, and verifications. "
+    "interface (GUI, CLI, or CODING), gui_driver (browser, desktop, or null), operations, coding_operations, and verifications. "
     "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
     "CLI operations are strings. "
     "CODING operations are objects with action create_file, update_file, review_code, or execute_code, "
     "plus file_path, content, and description when needed. "
     "CODING operations ARE valid test operations. They are not 'development activities' to be rejected. "
     "Creating files, writing code, and setting up test fixtures are legitimate testing operations. "
+    "IMPORTANT: When a phase has interface CODING, you MUST include coding_operations with the actual file operations. "
+    "Do not create a CODING phase with only verifications and no coding_operations. "
+    "Example: 'Create a file test.py with a hello world function' becomes a CODING phase with "
+    "coding_operations: [{'action': 'create_file', 'file_path': 'test.py', 'content': 'def hello(): print(\"world\")'}]. "
     "GUI verifications are questions about the page after the operations. "
     "CLI and CODING verifications are questions about the command output or file state. "
     "Write every verification as one or two complete sentences. Be specific and verbose. "
@@ -123,8 +127,6 @@ _PLAN_SYSTEM = (
     "Example: 'Run curl and verify that it reports an error.' has verification "
     "'The curl command reports an error.' It does not mention stdout. "
     "For coding operations, detect requests like 'create a file', 'update code', 'review the code', 'execute the script'. "
-    "Example: 'Create a file test.py with a hello world function' becomes a CODING phase with "
-    "coding_operations: [{'action': 'create_file', 'file_path': 'test.py', 'content': 'def hello(): print(\"world\")'}]. "
     "Some phases may be setup or preparation steps without explicit verifications. "
     "These are still important - if they fail, the entire test fails. "
     "If all phases have no verifications, the test passes if all operations succeed. "
@@ -162,6 +164,8 @@ _REPAIR_SYSTEM = (
     "A file, webhook, or command check is a later CLI phase whose depends_on lists the phase that produced it. "
     "Coding operations (create_file, update_file, review_code, execute_code) belong in CODING phases. "
     "CODING operations ARE valid test operations. They are not 'development activities' to be rejected. "
+    "IMPORTANT: When a phase has interface CODING, you MUST include coding_operations with the actual file operations. "
+    "Do not create a CODING phase with only verifications and no coding_operations. "
     "Keep phases in an order that respects those dependencies. "
     "You are the planner, not the executor. Do not reject a request because you cannot browse, read files or write code. "
     "Opening a page, typing into a named field, clicking a named button, and checking the resulting page "
@@ -700,6 +704,12 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
             problems.append(
                 f"{label} has no operations. "
                 f"A phase has to carry out a chain of operations to be actionable."
+            )
+        # CODING phases must have coding_operations
+        if phase.interface == "CODING" and not phase.coding_operations:
+            problems.append(
+                f"{label} has interface CODING but no coding_operations. "
+                f"A CODING phase must include coding_operations (create_file, update_file, review_code, execute_code)."
             )
         # Phases without verifications are now allowed (setup/preparation steps)
         # The test passes if all operations succeed, even without assertions
