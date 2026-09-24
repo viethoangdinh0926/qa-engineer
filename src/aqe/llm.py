@@ -206,7 +206,7 @@ _SCRIPT_SYSTEM = (
     "Do not read /evidence unless the operation names a file there."
 )
 
-_NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat"})
+_NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat", "pip", "pip3", "npm", "npm install", "apt", "apt-get", "yum", "dnf"})
 
 
 def _operations_from_action(action: dict) -> list[dict]:
