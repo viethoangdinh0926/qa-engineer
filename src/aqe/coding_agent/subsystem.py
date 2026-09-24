@@ -100,7 +100,10 @@ class CodingSubsystem:
 
     def _execute_via_subprocess(self, action: CodingAction, run_id: str) -> dict[str, Any]:
         """Execute coding action via subprocess (simplified implementation)."""
+        # Use work_dir directly as the base directory for files
+        # run_id is now the actual run ID (e.g., "8355f89ae0fc4dcba9ef10da1c4b1f5d")
         run_dir = self.work_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
         if action.action == "create_file":
             if not action.file_path or not action.content:
@@ -216,8 +219,8 @@ class CodingSubsystem:
         results = []
         errors = []
 
-        # Use evidence_dir name as run_id for isolation
-        run_id = evidence_dir.name
+        # Use evidence_dir parent name as run_id for isolation
+        run_id = evidence_dir.parent.name
 
         for operation in step.coding_operations:
             try:
