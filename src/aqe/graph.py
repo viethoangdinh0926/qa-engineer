@@ -154,7 +154,12 @@ def route_node(state: AgentState, deps: GraphDeps) -> dict:
     if step.interface == "GUI":
         phase = "execute_gui"
     elif step.interface == "CODING":
-        phase = "execute_coding"
+        # If CODING step has execute_code operations, route to CLI for sandbox execution
+        has_execute_code = any(op.action == "execute_code" for op in step.coding_operations or [])
+        if has_execute_code:
+            phase = "execute_cli"
+        else:
+            phase = "execute_coding"
     else:  # CLI
         phase = "execute_cli"
     return {"phase": phase, "step_views": _store_views(views)}
