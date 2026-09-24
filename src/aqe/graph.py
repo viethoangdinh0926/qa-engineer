@@ -242,6 +242,67 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
     evidence = dict(result.evidence)
     page_source = str(evidence.pop("page_source", "") or "")
 
+    # Handle CODING steps with assertions
+    # For CODING, if the operation succeeded, the assertion passes
+    # The assertion is more of a description than something to verify against evidence
+    if step.interface == "CODING" and (step.assertion or step.verifications):
+        passed = result.ok
+        judgment_text = result.summary if not passed else None
+        results: list[VerificationResult] = []
+        if step.assertion:
+            results.append(VerificationResult(question=step.assertion, passed=passed, judgment=judgment_text))
+        for verification in step.verifications or []:
+            results.append(VerificationResult(question=verification, passed=passed, judgment=judgment_text))
+        views = _views(state)
+        history = list(state.get("execution_history", []))
+        history.append(
+            {
+                "task": step.model_dump(),
+                "result": result.model_dump(),
+                "assertion_passed": passed,
+                "judgment": judgment_text,
+            }
+        )
+        if passed:
+            _set_status(
+                views,
+                index,
+                "passed",
+                assertion_passed=True,
+                judgment=judgment_text,
+                verification_results=results,
+                summary=result.summary,
+                evidence=evidence,
+            )
+            return {
+                "phase": "route",
+                "current_step": index + 1,
+                "step_views": _store_views(views),
+                "execution_history": history,
+                "last_result": result.model_copy(update={"assertion_passed": True}).model_dump(),
+            }
+        else:
+            _set_status(
+                views,
+                index,
+                "failed",
+                assertion_passed=False,
+                judgment=judgment_text,
+                verification_results=results,
+                summary=result.summary,
+                evidence=evidence,
+            )
+            for later in range(index + 1, len(views)):
+                _set_status(views, later, "skipped", assertion_passed=None)
+            reason = result.summary or f"Step {step.step} execution failed"
+            return {
+                "phase": "finish",
+                "reason_code": "assertion_failed",
+                "reason": reason,
+                "step_views": _store_views(views),
+                "execution_history": history,
+            }
+
     # Handle steps without assertions (non-testing steps)
     if not step.assertion and not step.verifications:
         # For non-testing steps, success is determined by execution success
