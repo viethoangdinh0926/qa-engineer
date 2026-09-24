@@ -19,6 +19,11 @@ class DockerSandbox:
         work.mkdir(parents=True, exist_ok=True)
         script_path = work / "script.py"
         script_path.write_text(script, encoding="utf-8")
+        
+        # Mount the run directory so CODING step files are accessible
+        # CODING files are created in evidence_dir.parent (the run directory)
+        run_dir = evidence_dir.parent
+        
         command = ["docker", "run", "--rm"]
         if not network:
             command.extend(["--network", "none"])
@@ -38,6 +43,8 @@ class DockerSandbox:
             "10001:10001",
             "-v",
             f"{evidence_dir.resolve()}:/evidence:ro",
+            "-v",
+            f"{run_dir.resolve()}:/run:ro",
             "-v",
             f"{script_path.resolve()}:/opt/script.py:ro",
             self.config.sandbox_image,

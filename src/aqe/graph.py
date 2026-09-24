@@ -309,6 +309,22 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
         passed = result.ok
         judgment_text = result.summary if not passed else None
         results: list[VerificationResult] = []
+        
+        # For CLI steps without assertions, check stdout/stderr for errors
+        if step.interface == "CLI":
+            stdout = str(evidence.get("stdout") or "")
+            stderr = str(evidence.get("stderr") or "")
+            # If stderr has content, consider it a failure
+            if stderr.strip():
+                passed = False
+                judgment_text = f"Command produced stderr output: {stderr}"
+            # If exit code is non-zero, it's already captured in result.ok
+            results.append(VerificationResult(
+                question="Command execution",
+                passed=passed,
+                judgment=judgment_text
+            ))
+        
         views = _views(state)
         history = list(state.get("execution_history", []))
         history.append(
