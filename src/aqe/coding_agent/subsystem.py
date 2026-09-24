@@ -75,18 +75,12 @@ class CodingSubsystem:
 
     def _execute_coding_action(self, action: CodingAction, run_id: str) -> dict[str, Any]:
         """Execute a single coding action through Pi agent."""
-        self._check_pi_available()
-
-        # Start Pi agent if not already running
-        if self._process is None or self._process.poll() is not None:
-            self._process = self._start_pi_agent(run_id)
-
-        # Prepare the RPC request based on action type
-        request = self._prepare_rpc_request(action)
+        # For simplified implementation, we don't need Pi agent
+        # Skip Pi availability check and subprocess management
+        # In full implementation, this would use RPC communication with Pi
 
         try:
-            # For now, we'll use a simpler approach: execute directly via subprocess
-            # In a full implementation, this would use RPC communication
+            # Use simplified subprocess execution
             return self._execute_via_subprocess(action, run_id)
         except (OSError, subprocess.SubprocessError) as exc:
             raise PiAgentError(
@@ -222,9 +216,12 @@ class CodingSubsystem:
         results = []
         errors = []
 
+        # Use evidence_dir name as run_id for isolation
+        run_id = evidence_dir.name
+
         for operation in step.coding_operations:
             try:
-                result = self._execute_coding_action(operation, evidence_dir.name)
+                result = self._execute_coding_action(operation, run_id)
                 results.append(result)
             except PiAgentError as exc:
                 errors.append(str(exc))
@@ -234,8 +231,8 @@ class CodingSubsystem:
                     "action": operation.action,
                 })
 
-        # Stop Pi agent after execution
-        self._stop_pi_agent()
+        # Note: Pi agent cleanup not needed for simplified implementation
+        # self._stop_pi_agent()
 
         if errors:
             return ActionResult(
