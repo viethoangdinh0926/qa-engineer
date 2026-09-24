@@ -123,6 +123,10 @@ _PLAN_SYSTEM = (
     "For coding operations, detect requests like 'create a file', 'update code', 'review the code', 'execute the script'. "
     "Example: 'Create a file test.py with a hello world function' becomes a CODING phase with "
     "coding_operations: [{'action': 'create_file', 'file_path': 'test.py', 'content': 'def hello(): print(\"world\")'}]. "
+    "Some phases may be setup or preparation steps without explicit verifications. "
+    "These are still important - if they fail, the entire test fails. "
+    "For setup steps like 'Create a directory' or 'Install dependencies', include the operation but no verification. "
+    "The system will still check that the operation succeeded. "
     "Put a phase that needs another phase's result after that phase, and list it in depends_on. "
     "One page visit is one GUI phase. Navigation, typing, and the click are that phase's operations. "
     "The page check is a verification on that same phase, not a later phase. "
@@ -690,12 +694,8 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
                 f"{label} has verifications but no operations. "
                 f"A phase has to carry out a chain of operations before it can evaluate {questions}."
             )
-        if not phase.verifications:
-            work = "; ".join(phase.operation_notes) or "the listed operations"
-            problems.append(
-                f"{label} has operations but no verifications. "
-                f"After {work}, the plan does not say what must be true, so the phase cannot be evaluated."
-            )
+        # Phases without verifications are now allowed (setup/preparation steps)
+        # They will still fail the test if the operations fail
     if not problems:
         return None
     return "\n".join(problems)

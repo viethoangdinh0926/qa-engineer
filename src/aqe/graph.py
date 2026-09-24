@@ -236,8 +236,66 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
     result = ActionResult.model_validate(state.get("last_result") or {})
     evidence = dict(result.evidence)
     page_source = str(evidence.pop("page_source", "") or "")
+
+    # Handle steps without assertions (non-testing steps)
+    if not step.assertion and not step.verifications:
+        # For non-testing steps, success is determined by execution success
+        passed = result.ok
+        judgment_text = result.summary if not passed else None
+        results: list[VerificationResult] = []
+        views = _views(state)
+        history = list(state.get("execution_history", []))
+        history.append(
+            {
+                "task": step.model_dump(),
+                "result": result.model_dump(),
+                "assertion_passed": passed,
+                "judgment": judgment_text,
+            }
+        )
+        if passed:
+            _set_status(
+                views,
+                index,
+                "passed",
+                assertion_passed=True,
+                judgment=judgment_text,
+                verification_results=results,
+                summary=result.summary,
+                evidence=evidence,
+            )
+            return {
+                "phase": "route",
+                "current_step": index + 1,
+                "step_views": _store_views(views),
+                "execution_history": history,
+                "last_result": result.model_copy(update={"assertion_passed": True}).model_dump(),
+            }
+        else:
+            _set_status(
+                views,
+                index,
+                "failed",
+                assertion_passed=False,
+                judgment=judgment_text,
+                verification_results=results,
+                summary=result.summary,
+                evidence=evidence,
+            )
+            for later in range(index + 1, len(views)):
+                _set_status(views, later, "skipped", assertion_passed=None)
+            reason = result.summary or f"Step {step.step} execution failed"
+            return {
+                "phase": "finish",
+                "reason_code": "assertion_failed",
+                "reason": reason,
+                "step_views": _store_views(views),
+                "execution_history": history,
+            }
+
+    # Handle steps with assertions (testing steps)
     questions = step.verifications or [step.assertion]
-    results: list[VerificationResult] = []
+    results = []
     judgments: list[str] = []
     passed = True
     for question in questions:

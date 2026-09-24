@@ -85,7 +85,7 @@ class TestStep(BaseModel):
     interface: Interface
     gui_driver: GuiDriverName | None = None
     action: str
-    assertion: str
+    assertion: str | None = ""  # Made optional for non-testing steps
     operations: list[GUIAction] = Field(default_factory=list)
     phase: int | None = None
     phase_name: str | None = None
@@ -97,8 +97,10 @@ class TestStep(BaseModel):
     def validate_shape(self) -> str | None:
         if not self.action.strip():
             return f"step {self.step} has an empty action"
-        if not self.assertion.strip():
-            return f"step {self.step} is missing an assertion"
+        # Assertion is now optional for non-testing steps
+        # None or empty string is valid (non-testing step)
+        if self.assertion and not self.assertion.strip():
+            return f"step {self.step} has an empty assertion"
         if self.interface == "GUI" and self.gui_driver is None:
             return f"step {self.step} is a GUI step with no gui_driver"
         if self.interface == "CLI" and self.gui_driver is not None:

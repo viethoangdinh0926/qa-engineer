@@ -257,18 +257,34 @@ The CODING interface supports the following operations through the Pi agent:
 - **review_code**: Analyze and review code files
 - **execute_code**: Run Python scripts and capture output
 
+#### Non-Testing Steps
+
+Steps can now be defined without explicit assertions for setup or preparation operations. These are still critical to the test:
+
+- **Setup Steps**: Operations like "Create a directory" or "Install dependencies" that don't need verification
+- **Failure Impact**: If a non-testing step fails, the entire test fails
+- **Validation**: Success is determined by whether the operation completed successfully (ActionResult.ok)
+
 #### Example Specification
 
 ```markdown
-1. CODING: Create a Python test file with a hello world function
+1. CODING: Create a project directory structure
+   # No assertion - setup step that must succeed
+
+2. CODING: Create a Python test file with a hello world function
    Assertion: File created successfully
 
-2. CODING: Update the test file to add a main function
+3. CODING: Update the test file to add a main function
    Assertion: File updated with main function
 
-3. CLI: Run the test file
+4. CLI: Run the test file
    Assertion: Output contains 'hello world'
 ```
+
+In this example:
+- Step 1 is a setup step without an assertion - if directory creation fails, the test fails
+- Steps 2-4 are testing steps with explicit assertions
+- All steps must succeed for the overall test to pass
 
 #### Pi Agent Requirements
 
