@@ -1043,11 +1043,13 @@ class ChatModelPlanner:
             # This handles cases like "python app.py" where app.py was created by a CODING step
             if command and any(ext in command for ext in ['.py', '.txt', '.json', '.md', '.sh']):
                 # Change working directory to /run for file operations
+                import shlex
                 return (
                     "import os\n"
                     "import subprocess\n"
+                    "import shlex\n"
                     "os.chdir('/run')\n"
-                    "result = subprocess.run(" + repr(command) + ", capture_output=True, text=True)\n"
+                    "result = subprocess.run(shlex.split(" + repr(command) + "), capture_output=True, text=True)\n"
                     "print(result.stdout)\n"
                     "if result.stderr:\n"
                     "    print(result.stderr, file=__import__('sys').stderr)\n"
