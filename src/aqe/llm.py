@@ -1,6 +1,7 @@
 """Planners that turn a specification into a test matrix or a rejection."""
 
 import json
+import logging
 import re
 import shlex
 from pathlib import PurePath
@@ -11,6 +12,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from aqe.config import EngineConfig
 from aqe.state import CodingAction, GUIAction, PlanResult, TestPhase, TestStep
+
+logger = logging.getLogger(__name__)
 
 NONSENSE_SPEC = "Hello, this is not a test specification."
 
@@ -126,6 +129,9 @@ _PLAN_SYSTEM = (
     "'The ls command returns nothing. stdout is empty. A successful exit code does not satisfy this check.' "
     "Example: 'Run curl and verify that it reports an error.' has verification "
     "'The curl command reports an error.' It does not mention stdout. "
+    "IMPORTANT: Never use environment variables ($VAR) in CLI operations. Use concrete values instead. "
+    "For example, instead of 'curl http://localhost:$PORT', use 'curl http://localhost:8080'. "
+    "Instead of 'docker port $container_id 5000', write a step that gets the actual container ID and uses it directly. "
     "For coding operations, detect requests like 'create a file', 'update code', 'review the code', 'execute the script'. "
     "Some phases may be setup or preparation steps without explicit verifications. "
     "These are still important - if they fail, the entire test fails. "
@@ -203,7 +209,10 @@ _OPS_SYSTEM = (
 _SCRIPT_SYSTEM = (
     "Reply with Python only, no markdown and no functions. "
     "Perform the operation in the user message and print its result to stdout. "
-    "Do not read /evidence unless the operation names a file there."
+    "Do not read /evidence unless the operation names a file there. "
+    "IMPORTANT: Never use environment variables ($VAR) in commands. Use concrete values instead. "
+    "For example, instead of 'curl http://localhost:$PORT', use 'curl http://localhost:8080'. "
+    "Instead of 'docker port $container_id 5000', use the actual container ID."
 )
 
 _NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat", "pip", "pip3", "npm", "npm install", "apt", "apt-get", "yum", "dnf"})
@@ -483,8 +492,8 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
                 if isinstance(op, dict):
                     try:
                         coding_operations.append(CodingAction.model_validate(op))
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"Failed to validate coding operation: {exc}")
 
         # Auto-detect interface if not specified
         if interface not in {"GUI", "CLI", "CODING"}:
@@ -787,9 +796,7 @@ def order_phases(phases: list[TestPhase]) -> tuple[list[TestPhase], str | None]:
 def _phase_to_step(phase: TestPhase) -> TestStep:
     notes = list(phase.operation_notes) or [_operation_label(operation) for operation in phase.operations]
     checks = list(phase.verifications)
-    if phase.interface == "CLI":
-        action = ". ".join(notes) if notes else phase.name
-    elif phase.interface == "CODING":
+    if phase.interface == "CLI" or phase.interface == "CODING":
         action = ". ".join(notes) if notes else phase.name
     else:
         action = phase.name or ". ".join(notes)
@@ -838,7 +845,7 @@ def _json_object(content: str) -> dict:
     except json.JSONDecodeError:
         value, _ = json.JSONDecoder().raw_decode(_repair_json(blob))
     if not isinstance(value, dict):
-        raise ValueError("planner output did not match the test plan schema")
+        raise TypeError("planner output did not match the test plan schema")
     return value
 
 
@@ -1030,20 +1037,60 @@ class ChatModelPlanner:
         return filled
 
     def script_for(self, intent: str) -> str:
-        if "Assertion: json:" in intent or "json:" in intent:
-            return (
-                "import json\n"
-                "from pathlib import Path\n"
-                "files = sorted(Path('/evidence').glob('*.json'))\n"
-                "print(files[0].read_text(encoding='utf-8') if files else '{}')\n"
-            )
+        # Use LLM to determine if we should use direct CLI command or Python script
+        # based on the testing environment and command type
         command = command_from_intent(intent)
         if command:
+            # Use LLM to decide execution strategy
+            try:
+                decision_prompt = "Given this test command: " + command + """
+
+Analyze the command and determine the best execution strategy:
+1. Should this be executed as a direct CLI command (without Python wrapper)?
+2. Or should it be wrapped in a Python script?
+
+Consider:
+- If the command is simple (curl, wget, ls, cat, grep, etc.) → use direct CLI
+- If the command needs to access localhost/host resources → use direct CLI on host
+- If the command needs complex logic, loops, or Python features → use Python script
+- If the command references files created by CODING steps → use Python script with /run directory
+- If the command uses shell variables or complex shell syntax → use direct CLI
+- IMPORTANT: Never use environment variables ($VAR) in commands. Use concrete values instead.
+- If unsure, use Python script for better error handling
+
+Return your answer in this exact JSON format:
+{{"use_direct_cli": true_or_false, "reason": "explanation"}}"""
+
+                decision = self.model.invoke([
+                    SystemMessage(content="You are a test execution strategist. Return valid JSON only."),
+                    HumanMessage(content=decision_prompt)
+                ])
+                
+                import json
+                decision_text = decision.content if hasattr(decision, 'content') else str(decision)
+                result = json.loads(decision_text.strip())
+                
+                use_direct_cli = result.get("use_direct_cli", False)
+                
+                if use_direct_cli:
+                    # Return the raw command for direct CLI execution
+                    return command
+            except Exception as exc:  # noqa: BLE001
+                # Fall back to Python script on any error
+                logger.warning(f"Failed to determine execution strategy: {exc}")
+            
+            # Original logic for Python script generation
+            if "Assertion: json:" in intent or "json:" in intent:
+                return (
+                    "import json\n"
+                    "from pathlib import Path\n"
+                    "files = sorted(Path('/evidence').glob('*.json'))\n"
+                    "print(files[0].read_text(encoding='utf-8') if files else '{}')\n"
+                )
             # For commands that reference files, prepend /run to make CODING files accessible
             # This handles cases like "python app.py" where app.py was created by a CODING step
             if command and any(ext in command for ext in ['.py', '.txt', '.json', '.md', '.sh']):
                 # Change working directory to /run for file operations
-                import shlex
                 return (
                     "import os\n"
                     "import subprocess\n"

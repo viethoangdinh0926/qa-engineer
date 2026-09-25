@@ -38,6 +38,8 @@ class CodingSubsystem:
         """Start Pi agent in RPC mode."""
         run_dir = self.work_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = run_dir / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             cmd = ["pi", "--mode", "rpc"]
@@ -46,7 +48,7 @@ class CodingSubsystem:
 
             process = subprocess.Popen(
                 cmd,
-                cwd=str(run_dir),
+                cwd=str(work_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
@@ -104,6 +106,8 @@ class CodingSubsystem:
         # run_id is now the actual run ID (e.g., "8355f89ae0fc4dcba9ef10da1c4b1f5d")
         run_dir = self.work_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = run_dir / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
 
         if action.action == "create_file":
             if not action.file_path or not action.content:
@@ -111,7 +115,7 @@ class CodingSubsystem:
                     "coding_agent_failed",
                     "create_file action requires file_path and content",
                 )
-            file_path = run_dir / action.file_path
+            file_path = work_dir / action.file_path
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(action.content, encoding="utf-8")
             return {
@@ -126,7 +130,7 @@ class CodingSubsystem:
                     "coding_agent_failed",
                     "update_file action requires file_path",
                 )
-            file_path = run_dir / action.file_path
+            file_path = work_dir / action.file_path
             if not file_path.exists():
                 raise PiAgentError(
                     "coding_agent_failed",
@@ -146,7 +150,7 @@ class CodingSubsystem:
                     "coding_agent_failed",
                     "review_code action requires file_path",
                 )
-            file_path = run_dir / action.file_path
+            file_path = work_dir / action.file_path
             if not file_path.exists():
                 raise PiAgentError(
                     "coding_agent_failed",
@@ -162,44 +166,11 @@ class CodingSubsystem:
             }
 
         elif action.action == "execute_code":
-            # For code execution, we might use Pi agent or direct execution
-            if not action.file_path:
-                raise PiAgentError(
-                    "coding_agent_failed",
-                    "execute_code action requires file_path",
-                )
-            file_path = run_dir / action.file_path
-            if not file_path.exists():
-                raise PiAgentError(
-                    "coding_agent_failed",
-                    f"File not found for execution: {action.file_path}",
-                )
-            try:
-                result = subprocess.run(
-                    ["python", str(file_path)],
-                    cwd=str(run_dir),
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                return {
-                    "success": result.returncode == 0,
-                    "message": f"Executed file: {action.file_path}",
-                    "file_path": str(file_path),
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode,
-                }
-            except subprocess.TimeoutExpired as exc:
-                raise PiAgentError(
-                    "coding_agent_failed",
-                    f"Code execution timed out: {exc}",
-                ) from exc
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise PiAgentError(
-                    "coding_agent_failed",
-                    f"Code execution failed: {exc}",
-                ) from exc
+            # Code execution is now handled by CLI steps, not CODING steps
+            raise PiAgentError(
+                "coding_agent_failed",
+                "execute_code action should be handled by CLI steps, not CODING steps",
+            )
 
         else:
             raise PiAgentError(

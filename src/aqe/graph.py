@@ -1,7 +1,10 @@
 """Plan, preflight, route, execute, validate, and reflect."""
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from langgraph.graph import END, StateGraph
 
@@ -13,11 +16,11 @@ from aqe.capabilities import (
     required_capabilities,
 )
 from aqe.cli_runtime.synthesizer import CLISubsystem
-from aqe.config import EngineConfig
 from aqe.coding_agent.subsystem import CodingSubsystem, PiAgentError
+from aqe.config import EngineConfig
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
-from aqe.judge import PageJudge, build_judge
+from aqe.judge import PageJudge, build_judge, judge_stderr
 from aqe.llm import Planner
 from aqe.state import (
     ActionResult,
@@ -28,6 +31,8 @@ from aqe.state import (
     TestStep,
     VerificationResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -46,6 +51,9 @@ class GraphDeps:
     probe: Probe
     evidence_dir_for: Callable[[str], str]
     judge: PageJudge | None = None
+    chat_model: Any = None
+    run_dir: Path | None = None
+    work_dir: Path | None = None
 
 
 def _views(state: AgentState) -> list[StepView]:
@@ -138,7 +146,60 @@ def preflight_node(state: AgentState, deps: GraphDeps) -> dict:
             "reason": " ".join(details) or "A required driver is unavailable.",
             "missing": missing,
         }
+
     return {"phase": "route", "missing": []}
+
+
+def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
+    views = _views(state)
+    _set_status(views, index, "error", assertion_passed=None, summary=message)
+    for later in range(index + 1, len(views)):
+        _set_status(views, later, "skipped", assertion_passed=None)
+    return {
+        "phase": "finish",
+        "reason_code": code,
+        "reason": message,
+        "step_views": _store_views(views),
+    }
+
+
+def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
+    views = _views(state)
+    _set_status(views, index, "error", assertion_passed=None, summary=message)
+    for later in range(index + 1, len(views)):
+        _set_status(views, later, "skipped", assertion_passed=None)
+    return {
+        "phase": "finish",
+        "reason_code": code,
+        "reason": message,
+        "step_views": _store_views(views),
+    }
+
+
+def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
+    views = _views(state)
+    _set_status(views, index, "error", assertion_passed=None, summary=message)
+    for later in range(index + 1, len(views)):
+        _set_status(views, later, "skipped", assertion_passed=None)
+    return {
+        "phase": "finish",
+        "reason_code": code,
+        "reason": message,
+        "step_views": _store_views(views),
+    }
+
+
+def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
+    views = _views(state)
+    _set_status(views, index, "error", assertion_passed=None, summary=message)
+    for later in range(index + 1, len(views)):
+        _set_status(views, later, "skipped", assertion_passed=None)
+    return {
+        "phase": "finish",
+        "reason_code": code,
+        "reason": message,
+        "step_views": _store_views(views),
+    }
 
 
 def route_node(state: AgentState, deps: GraphDeps) -> dict:
@@ -154,12 +215,7 @@ def route_node(state: AgentState, deps: GraphDeps) -> dict:
     if step.interface == "GUI":
         phase = "execute_gui"
     elif step.interface == "CODING":
-        # If CODING step has execute_code operations, route to CLI for sandbox execution
-        has_execute_code = any(op.action == "execute_code" for op in step.coding_operations or [])
-        if has_execute_code:
-            phase = "execute_cli"
-        else:
-            phase = "execute_coding"
+        phase = "execute_coding"
     else:  # CLI
         phase = "execute_cli"
     return {"phase": phase, "step_views": _store_views(views)}
@@ -178,14 +234,19 @@ def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
         elif kind == "cli":
             result = deps.cli.execute_runtime_action(step, evidence_dir)
         else:  # coding
-            result = deps.coding.execute_coding_action(step, evidence_dir)
+            # Check if CODING step contains execute_code - if so, delegate to CLI
+            if step.coding_operations and any(op.action == "execute_code" for op in step.coding_operations):
+                # Execute as CLI instead
+                result = deps.cli.execute_runtime_action(step, evidence_dir)
+            else:
+                result = deps.coding.execute_coding_action(step, evidence_dir)
     except HarnessError as exc:
         return _error_update(state, index, exc.code, str(exc))
     except PiAgentError as exc:
         return _error_update(state, index, exc.code, str(exc))
     except Exception as exc:  # noqa: BLE001
         import traceback
-        error_msg = f"{type(exc).__name__}: {str(exc)}\n{traceback.format_exc()}"
+        error_msg = f"{type(exc).__name__}: {exc!s}\n{traceback.format_exc()}"
         return _error_update(state, index, "engine_error", error_msg)
     return {"phase": "validate", "last_result": result.model_dump()}
 
@@ -195,6 +256,13 @@ def execute_gui_node(state: AgentState, deps: GraphDeps) -> dict:
 
 
 def execute_cli_node(state: AgentState, deps: GraphDeps) -> dict:
+    # Start container before first CLI execution
+    if deps.run_dir and deps.work_dir and deps.cli.sandbox._container_id is None:
+        try:
+            deps.cli.sandbox.start_container(deps.run_dir, deps.work_dir)
+        except HarnessError as exc:
+            index = state.get("current_step", 0)
+            return _error_update(state, index, exc.code, str(exc))
     return _execute(state, deps, "cli")
 
 
@@ -311,24 +379,21 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
     # Handle steps without assertions (non-testing steps)
     if not step.assertion and not step.verifications:
         # For non-testing steps, success is determined by execution success
-        passed = result.ok
-        judgment_text = result.summary if not passed else None
-        results: list[VerificationResult] = []
-        
-        # For CLI steps without assertions, check stdout/stderr for errors
+        # For CLI steps, pass if and only if exit code ($?) is 0
         if step.interface == "CLI":
-            stdout = str(evidence.get("stdout") or "")
-            stderr = str(evidence.get("stderr") or "")
-            # If stderr has content, consider it a failure
-            if stderr.strip():
-                passed = False
-                judgment_text = f"Command produced stderr output: {stderr}"
-            # If exit code is non-zero, it's already captured in result.ok
+            passed = result.ok  # result.ok is True when exit code is 0
+            judgment_text = result.summary if not passed else "Command executed successfully"
+            results: list[VerificationResult] = []
             results.append(VerificationResult(
                 question="Command execution",
                 passed=passed,
                 judgment=judgment_text
             ))
+        else:
+            # For non-CLI steps, use result.ok
+            passed = result.ok
+            judgment_text = result.summary if not passed else None
+            results: list[VerificationResult] = []
         
         views = _views(state)
         history = list(state.get("execution_history", []))
@@ -399,14 +464,28 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
                 passed = passed and ok
             else:
                 # For non-structured CLI assertions, check if command succeeded
-                # Command succeeded if exit code is 0 and no stderr
-                stdout = str(evidence.get("stdout") or "")
+                # If exit code is non-zero, it's an error
                 stderr = str(evidence.get("stderr") or "")
-                command_passed = result.ok and not stderr.strip()
+                command_passed = result.ok
+                if not result.ok:
+                    judgment = "Command failed with exit code"
+                # Use LLM to judge if stderr represents an actual error when exit code is 0
+                elif stderr.strip():
+                    if deps.chat_model is None:
+                        from aqe.chat import get_chat_model
+                        deps.chat_model = get_chat_model()
+                    is_error, explanation = judge_stderr(deps.chat_model, stderr, 0)
+                    if is_error:
+                        command_passed = False
+                        judgment = f"Command failed with error: {explanation}"
+                    else:
+                        judgment = f"Command succeeded with warnings: {explanation}"
+                else:
+                    judgment = "Command succeeded"
                 results.append(VerificationResult(
                     question=question,
                     passed=command_passed,
-                    judgment=f"Command {'succeeded' if command_passed else 'failed'}"
+                    judgment=judgment
                 ))
                 passed = passed and command_passed
         elif page_source.strip():
@@ -559,6 +638,14 @@ def finish_node(state: AgentState, deps: GraphDeps) -> dict:
         missing=list(state.get("missing") or []),
         steps=views,
     )
+
+    # Stop the shared sandbox container when run finishes
+    if deps.cli.sandbox._container_id is not None:
+        try:
+            deps.cli.sandbox.stop_container()
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to stop sandbox container")
+
     return {"phase": "done", "report": report.model_dump(), "step_views": _store_views(views)}
 
 

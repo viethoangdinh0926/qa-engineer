@@ -218,3 +218,90 @@ def build_judge() -> ChatPageJudge:
     from aqe.chat import get_chat_model
 
     return ChatPageJudge(get_chat_model())
+
+
+_STDERR_JUDGE_SYSTEM = (
+    "You judge whether stderr output from a command execution represents an actual error or just a warning/notification. "
+    "An actual error means the command failed to accomplish its intended purpose. "
+    "Warnings, deprecation notices, informational messages, and suggestions are not errors. "
+    "Consider the context: exit code 0 with warnings is usually not an error. "
+    "Reply with one JSON object and no other text. "
+    'Keys: "is_error" (true or false) and "explanation" '
+    "(one sentence explaining why this is or is not an error)."
+)
+
+
+def judge_stderr(model: BaseChatModel, stderr: str, exit_code: int) -> tuple[bool, str]:
+    """Judge whether stderr content represents an actual error or just a warning/notification."""
+    if not stderr.strip():
+        return False, "No stderr output"
+    
+    message = model.invoke(
+        [
+            SystemMessage(content=_STDERR_JUDGE_SYSTEM),
+            HumanMessage(
+                content=f"Exit code: {exit_code}\n\nstderr output:\n{stderr}"
+            ),
+        ]
+    )
+    content = message.content if isinstance(message.content, str) else str(message.content)
+    
+    try:
+        # Try to parse JSON directly for stderr judgment
+        text = _strip_fence(content)
+        payload = json.loads(text)
+        
+        if not isinstance(payload, dict):
+            return True, f"Stderr judgment was not a JSON object: {content[:200]}"
+        
+        is_error = None
+        for key in ("is_error", "error", "failed"):
+            if key in payload:
+                is_error = _as_bool(payload[key])
+                if is_error is not None:
+                    break
+        
+        if is_error is None:
+            return True, "Stderr judgment did not include error decision"
+        
+        explanation = ""
+        for key in ("explanation", "judgment", "reason"):
+            explanation = str(payload.get(key) or "").strip()
+            if explanation:
+                break
+        
+        if not explanation:
+            explanation = "No explanation provided"
+        
+        return is_error, explanation
+    except json.JSONDecodeError:
+        # Fallback to the general payload parser if direct JSON parsing fails
+        try:
+            payload = _decision_payload(content)
+            if payload is None:
+                return True, f"Unable to parse stderr judgment: {content[:200]}"
+            
+            is_error = None
+            for key in ("is_error", "error", "failed"):
+                if key in payload:
+                    is_error = _as_bool(payload[key])
+                    if is_error is not None:
+                        break
+            
+            if is_error is None:
+                return True, "Stderr judgment did not include error decision"
+            
+            explanation = ""
+            for key in ("explanation", "judgment", "reason"):
+                explanation = str(payload.get(key) or "").strip()
+                if explanation:
+                    break
+            
+            if not explanation:
+                explanation = "No explanation provided"
+            
+            return is_error, explanation
+        except (ValueError, KeyError) as e:
+            return True, f"Error judging stderr: {e!s}"
+    except (ValueError, KeyError) as e:
+        return True, f"Error judging stderr: {e!s}"

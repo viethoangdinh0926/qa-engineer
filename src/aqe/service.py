@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from collections.abc import Callable
@@ -15,12 +16,14 @@ from aqe.cli_runtime.sandbox import build_sandbox
 from aqe.cli_runtime.synthesizer import CLISubsystem
 from aqe.coding_agent.subsystem import CodingSubsystem, build_coding_agent
 from aqe.config import EngineConfig
-from aqe.errors import SpecValidationError
+from aqe.errors import HarnessError, SpecValidationError
 from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
 from aqe.gui.subsystem import GUISubsystem, build_gui
 from aqe.judge import PageJudge
 from aqe.llm import Planner, build_planner
 from aqe.state import TERMINAL_STATUSES, AgentState, status_for_verdict
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -162,6 +165,7 @@ class RunService:
 
         gui = None
         coding = None
+        sandbox = None
         try:
             config = self.config
             planner = self.planner or build_planner(config)
@@ -170,6 +174,9 @@ class RunService:
             coding = self.coding or build_coding_agent(config.runs_dir, config.pi_llm_model)
             evidence = self.run_dir(run_id) / "evidence"
             evidence.mkdir(parents=True, exist_ok=True)
+            work_dir = self.run_dir(run_id) / "work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
             deps = GraphDeps(
                 config=config,
                 planner=planner,
@@ -180,7 +187,40 @@ class RunService:
                 probe=self.probe,
                 evidence_dir_for=lambda _run_id: str(evidence),
                 judge=self.judge,
+                chat_model=None,
+                run_dir=self.run_dir(run_id),
+                work_dir=work_dir,
             )
+
+            # Check capabilities before starting graph to avoid sandbox start if unavailable
+            capabilities = self.probe()
+            if not capabilities.sandbox.available:
+                # Skip sandbox start if unavailable
+                deps.run_dir = None
+                deps.work_dir = None
+            else:
+                # Start the shared sandbox container for this run
+                try:
+                    sandbox.start_container(self.run_dir(run_id), work_dir)
+                except HarnessError as exc:
+                    # Handle sandbox start failures specifically
+                    record.status = "failed"
+                    record.ready = True
+                    record.error = str(exc)
+                    record.report = {
+                        "schema_version": "1",
+                        "id": run_id,
+                        "verdict": "error",
+                        "specification": record.specification,
+                        "reason_code": exc.code,
+                        "reason": str(exc),
+                        "missing": [],
+                        "steps": record.steps,
+                    }
+                    self._write_report(record)
+                    self._remember(record)
+                    return
+
             run_graph(deps, initial_state(run_id, record.specification), publish)
         except Exception as exc:  # noqa: BLE001
             record.status = "failed"
@@ -205,14 +245,14 @@ class RunService:
                     if closer:
                         closer()
             except Exception:  # noqa: BLE001
-                pass
+                logger.warning("Failed to close GUI subsystem")
             try:
                 if coding is not None:
                     coding_closer = getattr(coding, "close", None)
                     if coding_closer:
                         coding_closer()
             except Exception:  # noqa: BLE001
-                pass
+                logger.warning("Failed to close coding subsystem")
             if not record.ready:
                 record.ready = True
                 record.status = record.status if record.status in TERMINAL_STATUSES else "failed"
