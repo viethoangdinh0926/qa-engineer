@@ -1,4 +1,4 @@
-"""Probe optional browser, desktop, and coding support."""
+"""Probe optional browser and coding support."""
 
 import importlib.util
 import logging
@@ -20,17 +20,14 @@ class CapabilityFlag(BaseModel):
 
 class HostCapabilities(BaseModel):
     browser: CapabilityFlag
-    desktop: CapabilityFlag
     coding: CapabilityFlag
 
     def as_public(self) -> dict[str, object]:
         return {
             "browser": self.browser.available,
-            "desktop": self.desktop.available,
             "coding": self.coding.available,
             "detail": {
                 "browser": self.browser.detail,
-                "desktop": self.desktop.detail,
                 "coding": self.coding.detail,
             },
         }
@@ -84,27 +81,6 @@ def _probe_browser() -> CapabilityFlag:
     return CapabilityFlag(available=True, detail=None)
 
 
-def _probe_desktop() -> CapabilityFlag:
-    if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
-        return CapabilityFlag(
-            available=False,
-            detail="desktop input needs an X11 DISPLAY; Wayland is not supported in this slice.",
-        )
-    if not os.environ.get("DISPLAY"):
-        return CapabilityFlag(available=False, detail="No DISPLAY is set.")
-    missing = [
-        name
-        for name in ("mss", "pyautogui")
-        if not _module_available(name)
-    ]
-    if missing:
-        return CapabilityFlag(
-            available=False,
-            detail=f"Missing desktop packages: {', '.join(missing)}.",
-        )
-    return CapabilityFlag(available=True, detail=None)
-
-
 def _probe_coding(config: EngineConfig | None = None) -> CapabilityFlag:
     # For simplified implementation, coding capability is always available
     # We don't require Pi agent to be installed
@@ -116,7 +92,6 @@ def probe_host(config: EngineConfig | None = None) -> HostCapabilities:
     """Probe the machine. Imports of optional drivers stay inside this function."""
     return HostCapabilities(
         browser=_probe_browser(),
-        desktop=_probe_desktop(),
         coding=_probe_coding(config),
     )
 
@@ -124,7 +99,6 @@ def probe_host(config: EngineConfig | None = None) -> HostCapabilities:
 def unavailable_capabilities() -> HostCapabilities:
     return HostCapabilities(
         browser=CapabilityFlag(available=False, detail="browser forced unavailable"),
-        desktop=CapabilityFlag(available=False, detail="desktop forced unavailable"),
         coding=CapabilityFlag(available=False, detail="coding forced unavailable"),
     )
 
@@ -139,8 +113,6 @@ def required_capabilities(steps: list[dict[str, object]], *, llm: str, llm_confi
         driver = step.get("gui_driver")
         if interface == "GUI" and driver == "browser":
             needed.append("browser")
-        elif interface == "GUI" and driver == "desktop":
-            needed.append("desktop")
         elif interface == "CODING":
             needed.append("coding")
     if not llm_configured:
@@ -156,7 +128,6 @@ def missing_details(capabilities: HostCapabilities, names: list[str]) -> list[st
     details: list[str] = []
     flags = {
         "browser": capabilities.browser,
-        "desktop": capabilities.desktop,
         "coding": capabilities.coding,
     }
     for name in names:

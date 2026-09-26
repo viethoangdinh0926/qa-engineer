@@ -109,27 +109,35 @@ class Planner(Protocol):
 
 
 _AGENT_CAPABILITIES = (
-    "The agent can use two capabilities: a web browser (open a page, type into a field, click a button, press a key) "
-    "and host CLI tools (shell commands). "
-    "Desktop input and a coding agent are not available. "
-    "Every phase must be executable with the browser or a CLI command. "
-    "If the request cannot be tested with those capabilities, set accepted to false and explain that mismatch in reason. "
+    "The agent can use three capabilities: a web browser (open a page, type into a field, click a button, press a key), "
+    "host CLI tools (shell commands), and a Pi coding agent that generates code and files. "
+    "The agent does not test desktop applications. "
+    "A request to generate, write, or create source code or files, or a request for a CODING phase, "
+    "is a CODING phase. The Pi coding agent runs it through coding_operations "
+    "(create_file, update_file, or review_code), each with file_path, content, and description. "
+    "Do not turn that request into a CLI command such as cat, tee, or python -c. "
+    "If the request cannot be tested with the browser, CLI tools, or the Pi coding agent, "
+    "set accepted to false and explain that mismatch in reason. "
 )
 
 _PLAN_SYSTEM = (
     _AGENT_CAPABILITIES
     + "You are the planner, not the executor. Another system will run the phases you write: "
-    "GUI phases in the browser, and CLI phases with host CLI tools. "
+    "GUI phases in the browser, CLI phases with host CLI tools, and CODING phases with the Pi coding agent. "
     "Do not reject a request because you cannot click, browse, read files, or write code yourself. "
     "Turn the testing request into one linear pipeline of testing phases. "
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Each phase is a chain of operations followed by the verifications of those operations. "
     "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
-    "interface (GUI or CLI), gui_driver (browser or null), operations, and verifications. "
+    "interface (GUI, CLI, or CODING), gui_driver (browser or null), operations, coding_operations, and verifications. "
     "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
     "CLI operations are strings. "
+    "CODING operations are objects with action create_file, update_file, or review_code, plus file_path, content, and description. "
+    "When the user asks for a CODING phase, or asks the agent to generate code or files, that phase uses interface CODING "
+    "and coding_operations. It does not use interface CLI. "
     "GUI verifications are questions about the page after the operations. "
     "CLI verifications are questions about the command output. "
+    "CODING verifications are questions about the files the Pi coding agent wrote. "
     "Write every verification as one or two complete sentences. Be specific and verbose. "
     "Keep the original meaning of the user's check. Do not add a condition they did not ask for, and do not drop one they did. "
     "Do not shorten a check into contains:, json:, or status:. "
@@ -175,7 +183,8 @@ _PLAN_SYSTEM = (
 
 _REPAIR_SYSTEM = (
     _AGENT_CAPABILITIES
-    + "Revise the testing plan so every phase is executable with the browser or a CLI command. "
+    + "Revise the testing plan so every phase is executable with the browser, a CLI command, or the Pi coding agent. "
+    "Keep a requested CODING phase as interface CODING with coding_operations. "
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, coding_operations, and verifications. "
     "verifications must be strings. "
@@ -284,8 +293,8 @@ _REFINE_PLAN_SYSTEM = (
     "    {\n"
     "      \"phase\": integer (phase number),\n"
     "      \"name\": string (phase name),\n"
-    "      \"interface\": \"GUI\" or \"CLI\",\n"
-    "      \"gui_driver\": \"browser\", \"desktop\", or null,\n"
+    "      \"interface\": \"GUI\", \"CLI\", or \"CODING\",\n"
+    "      \"gui_driver\": \"browser\" or null,\n"
     "      \"depends_on\": [list of phase numbers],\n"
     "      \"operations\": [\n"
     "        {\n"
@@ -309,8 +318,8 @@ _REFINE_PLAN_SYSTEM = (
     "  \"steps\": [\n"
     "    {\n"
     "      \"step\": integer (step number),\n"
-    "      \"interface\": \"GUI\" or \"CLI\",\n"
-    "      \"gui_driver\": \"browser\", \"desktop\", or null,\n"
+    "      \"interface\": \"GUI\", \"CLI\", or \"CODING\",\n"
+    "      \"gui_driver\": \"browser\" or null,\n"
     "      \"action\": string (action description),\n"
     "      \"assertion\": string (assertion),\n"
     "      \"verifications\": [list of verification strings],\n"
@@ -336,7 +345,10 @@ _REFINE_PLAN_SYSTEM = (
     "}\n\n"
     "CRITICAL: For plan updates, use 'phase' (not 'id') for the phase number. Always include 'interface' field. "
     "GUI operations are objects. CLI operations are command strings. "
-    "Do not add a coding phase or a desktop phase."
+    "When the user asks for a CODING phase or for generated code or files, set interface to CODING and fill coding_operations. "
+    "Do not turn that request into a CLI phase. Do not add a desktop phase. Desktop applications are not tested. "
+    "Return every phase. Keep each phase number. Changing one phase must leave the others in the plan. "
+    "Omit a phase only when the user asked to remove that phase."
 )
 
 _NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat", "pip", "pip3", "npm", "npm install", "apt", "apt-get", "yum", "dnf"})
@@ -904,6 +916,69 @@ def fold_check_phases(phases: list[TestPhase]) -> list[TestPhase]:
     return folded
 
 
+_CODING_REQUEST = re.compile(
+    r"\bCODING\b|coding phase|coding agent|pi coding|pi agent|"
+    r"generate (?:the )?(?:code|files?)|write (?:the )?code",
+    re.IGNORECASE,
+)
+
+
+def _missing_coding_phase(text: str, phases: list[TestPhase]) -> str | None:
+    """A request for the Pi coding agent must stay a CODING phase."""
+    if _CODING_REQUEST.search(text) is None:
+        return None
+    if any(phase.interface == "CODING" and phase.coding_operations for phase in phases):
+        return None
+    return (
+        "The request asks for a CODING phase. The Pi coding agent generates the code or files. "
+        "Use interface CODING and coding_operations (create_file, update_file, or review_code). "
+        "Do not replace that phase with a CLI command."
+    )
+
+
+_REMOVE_PHASE = re.compile(
+    r"\b(?:remove|delete|drop)\s+(?:the\s+)?phase\s+(\d+)\b",
+    re.IGNORECASE,
+)
+_REPLACE_PLAN = re.compile(
+    r"\b(?:replace the (?:whole |entire )?plan|start over|discard (?:the )?other phases|keep only phase)\b",
+    re.IGNORECASE,
+)
+
+
+def _merge_phases(current: list[TestPhase], updated: list[TestPhase], feedback: str) -> list[TestPhase]:
+    """Apply returned phases onto the current plan without dropping phases the user did not remove."""
+    if _REPLACE_PLAN.search(feedback):
+        merged = {phase.phase: phase for phase in updated}
+    else:
+        merged = {phase.phase: phase for phase in current}
+        for phase in updated:
+            merged[phase.phase] = phase
+        for number in _REMOVE_PHASE.findall(feedback):
+            merged.pop(int(number), None)
+    return [merged[number] for number in sorted(merged)]
+
+
+def _apply_phase_update(
+    current: list[TestPhase],
+    raw_phases: list,
+    feedback: str,
+) -> tuple[list[TestPhase], list[TestStep], str | None]:
+    phases, problem = _coerce_phases(raw_phases)
+    if problem:
+        return [], [], problem
+    if not phases:
+        return [], [], "The update did not include any phases."
+    phases = _merge_phases(current, phases, feedback)
+    problem = _validate_phases(phases) or _missing_coding_phase(feedback, phases)
+    if problem:
+        return [], [], problem
+    ordered, order_problem = order_phases(phases)
+    if order_problem:
+        return [], [], order_problem
+    return ordered, [_phase_to_step(phase) for phase in ordered], None
+
+
 def _validate_phases(phases: list[TestPhase]) -> str | None:
     if not phases:
         return (
@@ -919,15 +994,15 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
                 f"{label} has no operations. "
                 f"A phase has to carry out a chain of operations to be actionable."
             )
-        if phase.interface == "CODING":
+        if phase.interface == "CODING" and not phase.coding_operations:
             problems.append(
-                f"{label} is not executable. A coding agent is not available. "
-                "Use the browser or a CLI command."
+                f"{label} is a CODING phase with no coding operations. "
+                "Include coding_operations for the Pi coding agent: create_file, update_file, or review_code."
             )
         if phase.interface == "GUI" and phase.gui_driver == "desktop":
             problems.append(
-                f"{label} is not executable. Desktop input is not available. "
-                "Use the browser or a CLI command."
+                f"{label} targets a desktop application. Desktop applications are not tested. "
+                "Use the browser, a CLI command, or a CODING phase."
             )
         if not phase.verifications:
             problems.append(
@@ -1241,7 +1316,7 @@ class ChatModelPlanner:
             return _reject(self._detail_rejection(specification, result.reason))
         if result.phases:
             result = result.model_copy(update={"phases": fold_check_phases(result.phases)})
-            gap = _validate_phases(result.phases)
+            gap = _validate_phases(result.phases) or _missing_coding_phase(specification, result.phases)
             if gap or _looks_incomplete(result.reason):
                 try:
                     result = self._repair_plan(specification, content, gap or result.reason or "")
@@ -1262,7 +1337,7 @@ class ChatModelPlanner:
                 )
                 if problem:
                     return _reject(self._detail_rejection(specification, problem))
-                problem = _validate_phases(ordered)
+                problem = _validate_phases(ordered) or _missing_coding_phase(specification, ordered)
                 if problem:
                     return _reject(self._detail_rejection(specification, problem))
                 steps = self._ensure_operations([_phase_to_step(phase) for phase in ordered])
@@ -1403,17 +1478,6 @@ class ChatModelPlanner:
         """Update the planner's context with coding instructions from previous steps."""
         self.coding_instructions = coding_instructions
 
-    def _phases_from_model(self, raw_phases: list) -> tuple[list[TestPhase], list[TestStep], str | None]:
-        phases, problem = _coerce_phases(raw_phases)
-        if not problem:
-            problem = _validate_phases(phases)
-        if problem:
-            return [], [], problem
-        ordered, order_problem = order_phases(phases)
-        if order_problem:
-            return [], [], order_problem
-        return ordered, [_phase_to_step(phase) for phase in ordered], None
-
     def refine_plan(self, current_phases: list[TestPhase], current_steps: list[TestStep],
                    user_feedback: str, chat_history: list[dict]) -> tuple[list[TestPhase], list[TestStep], str]:
         """Refine the plan based on user feedback. Returns (phases, steps, reasoning)."""
@@ -1457,7 +1521,11 @@ class ChatModelPlanner:
                 # User asked a question, return the answer without changing the plan
                 return current_phases, current_steps, response.get("answer", "Answer provided.")
             elif response.get("type") == "plan_update" or "phases" in response:
-                phases, steps, problem = self._phases_from_model(response.get("phases") or [])
+                phases, steps, problem = _apply_phase_update(
+                    current_phases,
+                    response.get("phases") or [],
+                    user_feedback,
+                )
                 if problem:
                     repaired = self.model.invoke(
                         [
@@ -1465,6 +1533,7 @@ class ChatModelPlanner:
                             HumanMessage(
                                 content=(
                                     f"User feedback: {user_feedback}\n\n"
+                                    f"Current phases must all remain unless the user asked to remove one.\n"
                                     f"Draft phases:\n{content}\n\n"
                                     f"What is wrong:\n{problem}"
                                 )
@@ -1473,7 +1542,11 @@ class ChatModelPlanner:
                     )
                     repaired_text = repaired.content if isinstance(repaired.content, str) else str(repaired.content)
                     revised = _json_object(_strip_fence(repaired_text))
-                    phases, steps, problem = self._phases_from_model(revised.get("phases") or [])
+                    phases, steps, problem = _apply_phase_update(
+                        current_phases,
+                        revised.get("phases") or [],
+                        user_feedback,
+                    )
                 if problem:
                     return current_phases, current_steps, f"The updated phases are not executable. {problem}"
                 reasoning = response.get("reasoning") or "Plan refined based on user feedback."

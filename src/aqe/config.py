@@ -13,7 +13,6 @@ class EngineConfig(BaseModel):
 
     llm: LlmProvider = "ollama"
     browser: Literal["playwright"] = "playwright"
-    desktop: Literal["pyautogui"] = "pyautogui"
     max_retries: int = 1
     spec_max_bytes: int = 100 * 1024
     runs_dir: Path = Field(default_factory=lambda: Path("runs"))

@@ -34,7 +34,7 @@ async function loadCapabilities() {
   const response = await fetch("/v1/capabilities");
   const data = await response.json();
   chips.replaceChildren();
-  for (const name of ["browser", "desktop", "coding"]) {
+  for (const name of ["browser", "coding"]) {
     const chip = document.createElement("span");
     chip.className = data[name] ? "chip" : "chip off";
     const detail = data.detail && data.detail[name] ? ` — ${data.detail[name]}` : "";

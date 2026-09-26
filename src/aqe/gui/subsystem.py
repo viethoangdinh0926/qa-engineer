@@ -1,32 +1,27 @@
-"""Capture, ground, then act."""
+"""Capture, ground, then act in the browser."""
 
 from pathlib import Path
 
 from aqe.config import EngineConfig
-from aqe.gui.desktop_driver import DesktopDriver
-from aqe.gui.grounding import CoordinateGrounder, Grounder, SelectorGrounder
+from aqe.gui.grounding import Grounder, SelectorGrounder
 from aqe.gui.playwright_driver import PlaywrightDriver
 from aqe.state import ActionResult, TestStep
 
 
 class GUISubsystem:
-    """Visual loop shared by the browser and desktop drivers."""
+    """Browser loop: capture the page, ground each operation, then act."""
 
     def __init__(
         self,
         browser_driver: PlaywrightDriver,
-        desktop_driver: DesktopDriver,
         browser_grounder: Grounder | None = None,
-        desktop_grounder: Grounder | None = None,
     ) -> None:
         self.browser_driver = browser_driver
-        self.desktop_driver = desktop_driver
         self.browser_grounder = browser_grounder or SelectorGrounder()
-        self.desktop_grounder = desktop_grounder or CoordinateGrounder()
 
     def execute_visual_action(self, step: TestStep, evidence_dir: Path) -> ActionResult:
-        driver = self.desktop_driver if step.gui_driver == "desktop" else self.browser_driver
-        grounder = self.desktop_grounder if step.gui_driver == "desktop" else self.browser_grounder
+        driver = self.browser_driver
+        grounder = self.browser_grounder
         image = driver.capture()
         operations = step.operations or [grounder.ground(image, step)]
         for operation in operations:
@@ -55,4 +50,4 @@ class GUISubsystem:
 
 def build_gui(config: EngineConfig) -> GUISubsystem:
     del config
-    return GUISubsystem(PlaywrightDriver(), DesktopDriver())
+    return GUISubsystem(PlaywrightDriver())

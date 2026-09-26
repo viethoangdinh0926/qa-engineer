@@ -1,5 +1,5 @@
 # Agentic Quality Engineering
-`aqe` is a quality-engineering service that turns a specification into a test plan, runs each step through a browser, desktop, CLI, or coding agent adapter, and returns one JSON report.
+`aqe` is a quality-engineering service that turns a specification into a test plan, runs each step through a browser, CLI, or coding agent adapter, and returns one JSON report.
 A run moves through plan, capability check, execute, validate, and reflect. The same run is available to a person in the browser, to a script over HTTP, and to another agent over [A2A](https://github.com/a2aproject/A2A).
 
 ## System Architecture
@@ -79,9 +79,9 @@ graph TB
 
 1. **Specification Input**: User provides natural language test specification via CLI, HTTP API, or A2A
 2. **Planning**: ChatModelPlanner converts specification into structured test steps using LLM
-3. **Capability Check**: System verifies required drivers (browser, desktop, coding agent) are available
+3. **Capability Check**: System verifies required drivers (browser, coding agent) are available
 4. **Execution**: Steps are routed to appropriate subsystem:
-   - GUI steps → Playwright (browser) or PyAutoGUI (desktop)
+   - GUI steps → Playwright (browser)
    - CLI steps → Host environment with direct CLI commands or Python scripts
    - CODING steps → Pi agent subprocess for code operations
 5. **Validation**: Judge evaluates assertions against collected evidence
@@ -136,7 +136,7 @@ graph TD
 - **Failure**: Transitions to `finish` with `not_a_test_plan` reason code
 
 #### 2. **preflight_node** - Capability Check
-- **Process**: Probes host for available capabilities (browser, desktop, coding agent, LLM)
+- **Process**: Probes host for available capabilities (browser, coding agent, LLM)
 - **Validation**: Compares required capabilities from test matrix against available ones
 - **Success**: Transitions to `route` if all required capabilities are available
 - **Failure**: Transitions to `finish` with `missing_capability` reason code
@@ -151,7 +151,7 @@ graph TD
 - **Process**: Executes GUI step through GUISubsystem (Playwright or PyAutoGUI)
 - **Evidence Collection**: Captures screenshots, page source, and page text
 - **Success**: Transitions to `validate` with ActionResult
-- **Error**: Transitions to `finish` with appropriate error code (browser_launch_failed, desktop_input_failed, etc.)
+- **Error**: Transitions to `finish` with appropriate error code (browser_launch_failed, engine_error, etc.)
 
 #### 5. **execute_cli_node** - CLI Execution
 - **Process**: Executes CLI step through CLISubsystem in host environment
@@ -226,7 +226,7 @@ The state machine handles errors at multiple levels:
 - **Planning Errors**: Invalid planner output → `not_a_test_plan`
 - **Capability Errors**: Missing drivers → `missing_capability`
 - **Execution Errors**: Driver failures → specific error codes
-  - GUI: `browser_launch_failed`, `desktop_input_failed`
+  - GUI: `browser_launch_failed`
   - CLI: `engine_error`
   - CODING: `coding_agent_failed`, `coding_agent_not_available`
 - **Validation Errors**: Assertion failures → `assertion_failed` (with retry)
@@ -332,8 +332,8 @@ uv pip install -e .
 uv run playwright install chromium
 uv run playwright install-deps
 ```
-That install includes Playwright, the desktop driver packages, the OpenAI, Anthropic, and Ollama clients, and pytest. Chromium is downloaded by the commands above. For coding operations, install the Pi agent separately. Copy `.env_template` to `.env` and set `LLM_PROVIDER` to `openai`, `anthropic`, or `ollama`, plus `LLM_MODEL` and the matching credentials. OpenAI can use `OPENAI_API_KEY`, an AIA gateway (`AIA_GATEWAY_CLIENT_ID`, `AIA_GATEWAY_CLIENT_SECRET`, `AIA_GATEWAY_BASE_URL`), or `REALLM_BASE_URL` with `REALLM_API_KEY`. Set `SSL_VERIFY=false` only when the gateway certificate cannot be verified. Optionally set `PI_LLM_MODEL` to specify which LLM model the Pi agent should use for coding operations.
-Headless Playwright does not need a desktop session. The desktop driver does need an X11 `DISPLAY`. Wayland alone is not enough.
+That install includes Playwright, the OpenAI, Anthropic, and Ollama clients, and pytest. Chromium is downloaded by the commands above. For coding operations, install the Pi agent separately. Copy `.env_template` to `.env` and set `LLM_PROVIDER` to `openai`, `anthropic`, or `ollama`, plus `LLM_MODEL` and the matching credentials. OpenAI can use `OPENAI_API_KEY`, an AIA gateway (`AIA_GATEWAY_CLIENT_ID`, `AIA_GATEWAY_CLIENT_SECRET`, `AIA_GATEWAY_BASE_URL`), or `REALLM_BASE_URL` with `REALLM_API_KEY`. Set `SSL_VERIFY=false` only when the gateway certificate cannot be verified. Optionally set `PI_LLM_MODEL` to specify which LLM model the Pi agent should use for coding operations.
+Headless Playwright does not need a display.
 ## Run a specification
 `aqe run` and `aqe serve` take no flags. Set the command parameters in `.env`.
 
@@ -341,19 +341,19 @@ Headless Playwright does not need a desktop session. The desktop driver does nee
 uv run aqe run
 ```
 
-`SPEC_PATH` is the specification file. `aqe run` starts the sample registration app on `SUT_PORT`, plans with the chat model in `.env`, drives browser steps with headless Chromium, desktop steps with PyAutoGUI, checks CLI steps in the host environment, and executes coding steps through the Pi agent. The command prints the path to `runs/<id>/report.json`. Exit status is `0` when `verdict` is `pass`.
+`SPEC_PATH` is the specification file. `aqe run` starts the sample registration app on `SUT_PORT`, plans with the chat model in `.env`, drives browser steps with headless Chromium, checks CLI steps in the host environment, and executes coding steps through the Pi agent. The command prints the path to `runs/<id>/report.json`. Exit status is `0` when `verdict` is `pass`.
 
-If Chromium, an X11 display for a desktop step, or the Pi agent is missing, the run is rejected before any step executes. A desktop step still requires an X11 display.
+If Chromium or the Pi agent is missing, the run is rejected before any step executes.
 
 ## Serve the agent
 ```bash
 uv run aqe serve
 ```
 The process binds `HOST` and `PORT` from `.env` (`127.0.0.1:8000` by default) with no authentication. Reports are written under `RUNS_DIR`.
-- `http://127.0.0.1:8000/` submits a specification and lists runs. Chips show whether browser, desktop, and coding agent are available on this host.
+- `http://127.0.0.1:8000/` submits a specification and lists runs. Chips show whether the browser and coding agent are available on this host.
 - `http://127.0.0.1:8000/runs/<id>` shows each step as it moves from pending to running to passed, failed, retrying, error, or skipped.
 - `GET /healthz` stays healthy even when optional drivers are absent.
-- `GET /v1/capabilities` reports `browser`, `desktop`, and `coding`.
+- `GET /v1/capabilities` reports `browser` and `coding`.
 ### HTTP
 ```bash
 curl -s -X POST http://127.0.0.1:8000/v1/runs \
@@ -374,7 +374,7 @@ Every finished run writes the same `TestReport` object to `runs/<id>/report.json
 | `error` | The harness broke after start. The result is inconclusive. |
 | `rejected` | The text could not become a plan, or the host is missing a driver the plan needs. |
 | `canceled` | The run was canceled before it finished. |
-A pass has `verdict == "pass"`. `specification` is the testing request that was submitted. `reason_code` explains a non-pass (`assertion_failed`, `browser_launch_failed`, `desktop_input_failed`, `driver_timeout`, `engine_error`, `not_a_test_plan`, `missing_capability`, `coding_agent_failed`, `coding_agent_not_available`, or `canceled`). Each step has `assertion_passed` set to `true`, `false`, or `null`.
+A pass has `verdict == "pass"`. `specification` is the testing request that was submitted. `reason_code` explains a non-pass (`assertion_failed`, `browser_launch_failed`, `driver_timeout`, `engine_error`, `not_a_test_plan`, `missing_capability`, `coding_agent_failed`, `coding_agent_not_available`, or `canceled`). Each step has `assertion_passed` set to `true`, `false`, or `null`.
 ## Tests
 ```bash
 uv run pytest

@@ -235,7 +235,6 @@ def preflight_node(state: AgentState, deps: GraphDeps) -> dict:
     missing = []
     flags = {
         "browser": capabilities.browser.available,
-        "desktop": capabilities.desktop.available,
         "coding": capabilities.coding.available,
         "llm": deps.config.llm_configured,
     }

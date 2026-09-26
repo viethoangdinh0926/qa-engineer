@@ -91,7 +91,6 @@ class LabeledPlanner:
 def available_capabilities() -> HostCapabilities:
     return HostCapabilities(
         browser=CapabilityFlag(available=True),
-        desktop=CapabilityFlag(available=True),
         coding=CapabilityFlag(available=True),
     )
 
@@ -172,16 +171,14 @@ def test_sample_run_passes(tmp_path: Path) -> None:
     assert (tmp_path / "runs" / snapshot["id"] / "report.json").is_file()
 
 
-def test_routes_desktop_and_cli(tmp_path: Path) -> None:
+def test_routes_browser_and_cli(tmp_path: Path) -> None:
     browser = RecordingDriver()
-    desktop = RecordingDriver()
-    gui = GUISubsystem(browser, desktop)
+    gui = GUISubsystem(browser)
     service = _service(tmp_path, gui=gui)
-    spec = "GUI desktop: Click the Save button\nAssertion: contains:Save\n"
+    spec = "GUI browser: Click the Save button\nAssertion: contains:Save\n"
     finished = service.wait(service.submit(spec)["id"])
     assert finished["report"]["verdict"] == "pass"
-    assert desktop.actions
-    assert browser.actions == []
+    assert browser.actions
     cli_spec = "CLI: Check the session log\nAssertion: contains:ok\n"
     finished_cli = service.wait(service.submit(cli_spec)["id"])
     assert finished_cli["report"]["steps"][0]["interface"] == "CLI"
@@ -572,11 +569,36 @@ def test_saved_run_reloads_its_state(tmp_path: Path) -> None:
     assert again["steps"]
 
 
-def test_coding_and_desktop_phases_are_not_executable() -> None:
-    from aqe.llm import _validate_phases
-    from aqe.state import TestPhase
+def test_a_requested_coding_phase_is_kept() -> None:
+    from aqe.llm import _missing_coding_phase, _validate_phases
+    from aqe.state import CodingAction, TestPhase
 
-    coding = _validate_phases(
+    cli_only = [
+        TestPhase(
+            phase=1,
+            name="Write a file",
+            interface="CLI",
+            operation_notes=["cat > hello.py"],
+            verifications=["The file exists."],
+        )
+    ]
+    finding = _missing_coding_phase("Make a CODING phase that writes hello.py", cli_only)
+    assert finding is not None
+    assert "CODING" in finding
+    coding = [
+        TestPhase(
+            phase=1,
+            name="Write a file",
+            interface="CODING",
+            verifications=["The file hello.py exists."],
+            coding_operations=[
+                CodingAction(action="create_file", file_path="hello.py", content="print('hi')\n")
+            ],
+        )
+    ]
+    assert _missing_coding_phase("Make a CODING phase that writes hello.py", coding) is None
+    assert _validate_phases(coding) is None
+    missing_ops = _validate_phases(
         [
             TestPhase(
                 phase=1,
@@ -587,8 +609,8 @@ def test_coding_and_desktop_phases_are_not_executable() -> None:
             )
         ]
     )
-    assert coding is not None
-    assert "not executable" in coding
+    assert missing_ops is not None
+    assert "coding operations" in missing_ops
     desktop = _validate_phases(
         [
             TestPhase(
@@ -602,4 +624,50 @@ def test_coding_and_desktop_phases_are_not_executable() -> None:
         ]
     )
     assert desktop is not None
-    assert "Desktop" in desktop
+    assert "desktop application" in desktop.lower()
+
+
+def test_fixing_one_phase_keeps_the_others() -> None:
+    from aqe.llm import _merge_phases
+    from aqe.state import TestPhase
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Register",
+            interface="GUI",
+            gui_driver="browser",
+            operation_notes=["open the form"],
+            verifications=["The page contains registered."],
+        ),
+        TestPhase(
+            phase=2,
+            name="Check the log",
+            interface="CLI",
+            operation_notes=["cat log"],
+            verifications=["The log contains ok."],
+        ),
+        TestPhase(
+            phase=3,
+            name="List files",
+            interface="CLI",
+            operation_notes=["ls"],
+            verifications=["The command prints the file name."],
+        ),
+    ]
+    fixed = [
+        TestPhase(
+            phase=2,
+            name="Check the log",
+            interface="CLI",
+            operation_notes=["cat service.log"],
+            verifications=["The log file contains the word ready."],
+        )
+    ]
+    merged = _merge_phases(current, fixed, "Fix phase 2 so it reads service.log")
+    assert [phase.phase for phase in merged] == [1, 2, 3]
+    assert merged[0].name == "Register"
+    assert merged[1].operation_notes == ["cat service.log"]
+    assert merged[2].name == "List files"
+    removed = _merge_phases(current, fixed, "Remove phase 3")
+    assert [phase.phase for phase in removed] == [1, 2]

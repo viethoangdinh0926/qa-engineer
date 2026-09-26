@@ -74,6 +74,8 @@ class TestPhase(BaseModel):
     coding_operations: list[CodingAction] = Field(default_factory=list)
 
     def validate_shape(self) -> str | None:
+        if self.interface == "GUI" and self.gui_driver == "desktop":
+            return f"phase {self.phase} targets a desktop application, which is not tested"
         if self.interface == "CODING" and self.gui_driver is not None:
             return f"phase {self.phase} is a CODING phase with a gui_driver"
         if self.interface == "CODING" and not self.coding_operations:
@@ -104,6 +106,8 @@ class TestStep(BaseModel):
         # None or empty string is valid (non-testing step)
         if self.assertion and not self.assertion.strip():
             return f"step {self.step} has an empty assertion"
+        if self.interface == "GUI" and self.gui_driver == "desktop":
+            return f"step {self.step} targets a desktop application, which is not tested"
         if self.interface == "GUI" and self.gui_driver is None:
             return f"step {self.step} is a GUI step with no gui_driver"
         if self.interface == "CLI" and self.gui_driver is not None:
