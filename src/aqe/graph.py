@@ -1,6 +1,8 @@
 """Plan, preflight, route, execute, validate, and reflect."""
 
+import json
 import logging
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +24,7 @@ from aqe.state import PlanResult
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
 from aqe.judge import PageJudge, build_judge
-from aqe.llm import Planner
+from aqe.llm import Planner, _coding_operations_from
 from aqe.state import (
     ActionResult,
     AgentState,
@@ -101,47 +103,10 @@ def _matrix(state: AgentState) -> list[TestStep]:
                     if cli_commands or gui_actions:
                         item["operations"] = gui_actions
                 
-                # Coerce coding operations
-                coding_operations = item.get("coding_operations", [])
-                if isinstance(coding_operations, list):
-                    for op in coding_operations:
-                        if isinstance(op, dict):
-                            # Fix common LLM mistakes: rename 'type' to 'action'
-                            if "type" in op and "action" not in op:
-                                op["action"] = op.pop("type")
-                                # Map common type values to action values
-                                type_to_action = {
-                                    "write_file": "create_file",
-                                    "create_file": "create_file",
-                                    "update_file": "update_file",
-                                    "edit_file": "update_file",
-                                    "modify_file": "update_file",
-                                    "review_code": "review_code",
-                                    "execute_code": "execute_code",
-                                    "execute_command": "execute_code",
-                                    "execute_shell": "execute_code",
-                                    "run_command": "execute_code",
-                                    "run": "execute_code",
-                                    "run_code": "execute_code",
-                                    "make_executable": "execute_code",
-                                }
-                                if op["action"] in type_to_action:
-                                    op["action"] = type_to_action[op["action"]]
-                            # Fix common LLM mistakes: rename 'operation' to 'action'
-                            if "operation" in op and "action" not in op:
-                                op["action"] = op.pop("operation")
-                            # Fix common LLM mistakes: rename 'execute_command' to 'execute_code'
-                            if op.get("action") == "execute_command":
-                                op["action"] = "execute_code"
-                            # Fix common LLM mistakes: rename 'execute_shell' to 'execute_code'
-                            if op.get("action") == "execute_shell":
-                                op["action"] = "execute_code"
-                            # Fix common LLM mistakes: rename 'run_command' to 'execute_code'
-                            if op.get("action") == "run_command":
-                                op["action"] = "execute_code"
-                            # Fix common LLM mistakes: rename 'run' to 'execute_code' for coding operations
-                            if op.get("action") == "run":
-                                op["action"] = "execute_code"
+                item["coding_operations"] = [
+                    operation.model_dump()
+                    for operation in _coding_operations_from(item.get("coding_operations") or [])
+                ]
             
             matrix.append(TestStep.model_validate(item))
         except Exception as exc:  # noqa: BLE001
@@ -259,23 +224,6 @@ def preflight_node(state: AgentState, deps: GraphDeps) -> dict:
     return {"phase": "route", "missing": []}
 
 
-def _retry_limit(state: AgentState, deps: GraphDeps) -> int:
-    value = state.get("max_retries")
-    if isinstance(value, int):
-        return value
-    return deps.config.max_retries
-
-
-def _matrix_dump(matrix: list) -> list[dict]:
-    dumped: list[dict] = []
-    for item in matrix:
-        dumped.append(item if isinstance(item, dict) else item.model_dump())
-    return dumped
-
-
-_EXECUTE_PHASE = {"gui": "execute_gui", "cli": "execute_cli", "coding": "execute_coding"}
-
-
 def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
     views = _views(state)
     _set_status(views, index, "error", assertion_passed=None, summary=message)
@@ -351,13 +299,7 @@ def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
     from pathlib import Path
 
     evidence_dir = Path(deps.evidence_dir_for(state["run_id"]))
-    
-    # Track retry attempts for this step
-    attempt_counts = state.get("attempt_counts", {})
-    step_key = f"{index}_{kind}"
-    current_attempts = attempt_counts.get(step_key, 0)
-    max_retries = _retry_limit(state, deps)
-    
+
     try:
         if kind == "gui":
             result = deps.gui.execute_visual_action(step, evidence_dir)
@@ -371,69 +313,21 @@ def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
             else:
                 result = deps.coding.execute_coding_action(step, evidence_dir)
     except HarnessError as exc:
-        return _handle_failure(state, deps, index, kind, step, exc.code, str(exc), current_attempts, max_retries)
+        return _error_update(state, index, exc.code, str(exc))
     except PiAgentError as exc:
-        return _handle_failure(state, deps, index, kind, step, exc.code, str(exc), current_attempts, max_retries)
+        return _error_update(state, index, exc.code, str(exc))
     except Exception as exc:  # noqa: BLE001
         import traceback
         error_msg = f"{type(exc).__name__}: {exc!s}\n{traceback.format_exc()}"
-        return _handle_failure(state, deps, index, kind, step, "engine_error", error_msg, current_attempts, max_retries)
-    
-    # Step succeeded, reset attempt count
-    attempt_counts[step_key] = 0
-    
-    # Preserve coding_instructions in state
+        return _error_update(state, index, "engine_error", error_msg)
+
     coding_instructions = state.get("coding_instructions", [])
-    
     return {
         "phase": "validate",
         "last_result": result.model_dump(),
-        "attempt_counts": attempt_counts,
+        "attempt_counts": state.get("attempt_counts", {}),
         "coding_instructions": coding_instructions,
     }
-
-
-def _handle_failure(state: AgentState, deps: GraphDeps, index: int, kind: str, step: dict, code: str, message: str, current_attempts: int, max_retries: int) -> dict:
-    """Handle step failure with retry logic."""
-    step_key = f"{index}_{kind}"
-    attempt_counts = state.get("attempt_counts", {})
-    
-    if current_attempts < max_retries:
-        # Increment attempt count
-        attempt_counts[step_key] = current_attempts + 1
-        
-        # Ask LLM to fix the step
-        try:
-            payload = step if isinstance(step, dict) else step.model_dump()
-            fixed_step = deps.planner.fix_step(payload, message, current_attempts)
-            
-            # Check if LLM determined this should not be retried (hard failure)
-            if fixed_step.get("_should_not_retry"):
-                judgment = fixed_step.get("_retry_judgment", "Hard failure detected by LLM")
-                return _error_update(state, index, code, f"Hard failure: {judgment}")
-            
-            # Update the matrix with the fixed step
-            matrix = _matrix(state)
-            matrix[index] = fixed_step
-            
-            # Set status to retrying
-            views = _views(state)
-            _set_status(views, index, "retrying", assertion_passed=None, summary=f"Retry {current_attempts + 1}/{max_retries}: {message}")
-            
-            return {
-                "phase": _EXECUTE_PHASE.get(kind, "finish"),
-                "test_matrix": _matrix_dump(matrix),
-                "attempt_counts": attempt_counts,
-                "step_views": _store_views(views),
-            }
-        except Exception as exc:  # noqa: BLE001
-            # If fixing fails, proceed to error
-            import traceback
-            error_msg = f"Failed to fix step: {exc}\n{traceback.format_exc()}"
-            return _error_update(state, index, code, f"{message}\n\n{error_msg}")
-    else:
-        # Max retries reached, fail the step
-        return _error_update(state, index, code, f"Failed after {max_retries} retries: {message}")
 
 
 def execute_gui_node(state: AgentState, deps: GraphDeps) -> dict:
@@ -468,6 +362,73 @@ def _structured_check(question: str) -> bool:
     return text.startswith(("contains:", "json:", "status:"))
 
 
+def _cli_exit_code(result: ActionResult, evidence: dict) -> int:
+    """$? for a CLI step. A missing code follows whether the runner reported success."""
+    raw = evidence.get("exit_code")
+    if raw is None:
+        return 0 if result.ok else 1
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0 if result.ok else 1
+
+
+def _cli_packet(question: str, exit_code: int, stdout: str, stderr: str) -> str:
+    return (
+        f"Verification statement:\n{question.strip()}\n\n"
+        f"$?: {exit_code}\n\n"
+        f"stdout:\n{stdout}\n\n"
+        f"stderr:\n{stderr}\n"
+    )
+
+
+def _run_verify_script(work_dir: Path, script: str) -> tuple[int, str, str]:
+    """Run the verification command the model requested, in the phase directory."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "verify.sh"
+    path.write_text(script if script.endswith("\n") else f"{script}\n", encoding="utf-8")
+    try:
+        result = subprocess.run(
+            ["bash", str(path)],
+            cwd=str(work_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", "Verification command timed out"
+    except OSError as exc:
+        return 1, "", str(exc)
+    return result.returncode, result.stdout, result.stderr
+
+
+def _cli_verification(deps: GraphDeps, question: str, result: ActionResult, evidence: dict) -> Judgment:
+    """Ask the model to decide a CLI check, or to name a command the agent should run."""
+    exit_code = _cli_exit_code(result, evidence)
+    stdout = str(evidence.get("stdout") or "")
+    stderr = str(evidence.get("stderr") or "")
+    judge = deps.judge
+    if judge is None:
+        judge = build_judge()
+        deps.judge = judge
+    if hasattr(judge, "judge_cli"):
+        check = judge.judge_cli(question, exit_code, stdout, stderr)
+        if check.script.strip():
+            work = deps.work_dir
+            if work is None:
+                return Judgment(
+                    passed=False,
+                    judgment=check.judgment or "The verification command has no work directory.",
+                )
+            code, out, err = _run_verify_script(Path(work), check.script)
+            check = judge.judge_cli(question, code, out, err, follow_up=True)
+        if check.passed is None:
+            return Judgment(passed=False, judgment=check.judgment or "The model did not decide the verification.")
+        return Judgment(passed=check.passed, judgment=check.judgment)
+    return _judged_or_unreadable(deps, question, _cli_packet(question, exit_code, stdout, stderr))
+
+
 def _command_text(evidence: dict) -> str:
     stdout = str(evidence.get("stdout") or "")
     stderr = str(evidence.get("stderr") or "")
@@ -475,7 +436,44 @@ def _command_text(evidence: dict) -> str:
     text = f"stdout:\n{stdout}\n\nstderr:\n{stderr}"
     if exit_code is not None:
         text = f"{text}\n\nexit_code: {exit_code}"
+    script_result = str(evidence.get("script_result") or "").strip()
+    if script_result:
+        text = f"{text}\n\nscript_result:\n{script_result}\n"
     return text
+
+
+def _coding_text(evidence: dict) -> str:
+    """Show the files a coding phase wrote so each verification can be judged from them."""
+    results = evidence.get("results")
+    blocks: list[str] = []
+    if isinstance(results, list):
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            lines: list[str] = []
+            action = str(item.get("action") or "").strip()
+            path = str(item.get("file_path") or "").strip()
+            if action:
+                lines.append(f"action: {action}")
+            if path:
+                lines.append(f"file: {path}")
+            error = str(item.get("error") or "").strip()
+            if item.get("success") is False or error:
+                lines.append(f"error: {error or 'the coding operation failed'}")
+            elif "content" in item:
+                content = str(item.get("content") or "")
+                lines.append(f"content length: {len(content)} characters")
+                lines.append(f"content:\n{content}")
+            if lines:
+                blocks.append("\n".join(lines))
+    if blocks:
+        return "\n\n".join(blocks)
+    if any(key in evidence for key in ("stdout", "stderr", "exit_code")):
+        return _command_text(evidence)
+    errors = evidence.get("errors")
+    if isinstance(errors, list) and errors:
+        return "errors:\n" + "\n".join(str(item) for item in errors)
+    return str(evidence.get("summary") or "")
 
 
 def _judged_or_unreadable(deps: GraphDeps, question: str, page_source: str) -> Judgment:
@@ -499,40 +497,6 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
     evidence = dict(result.evidence)
     page_source = str(evidence.pop("page_source", "") or "")
 
-    # For GUI steps with verifications, check execution result first before calling judge
-    # If execution failed, trigger retry logic
-    if step.interface == "GUI" and (step.assertion or step.verifications) and not result.ok:
-        step_key = f"{index}_gui"
-        attempt_counts = state.get("attempt_counts", {})
-        current_attempts = attempt_counts.get(step_key, 0)
-        max_retries = _retry_limit(state, deps)
-        
-        if current_attempts < max_retries:
-            # Increment attempt count
-            attempt_counts[step_key] = current_attempts + 1
-            
-            # Ask LLM to fix the step
-            try:
-                fixed_step = deps.planner.fix_step(step.model_dump(), result.summary, current_attempts)
-                
-                # Update the matrix with the fixed step
-                matrix[index] = fixed_step
-                
-                # Set status to retrying
-                views = _views(state)
-                _set_status(views, index, "retrying", assertion_passed=None, summary=f"Retry {current_attempts + 1}/{max_retries}: {result.summary}")
-                
-                return {
-                    "phase": "execute_gui",  # Retry the GUI execution
-                    "test_matrix": _matrix_dump(matrix),
-                    "attempt_counts": attempt_counts,
-                    "step_views": _store_views(views),
-                }
-            except Exception as exc:  # noqa: BLE001
-                # If fixing fails, proceed to normal verification (which will fail)
-                import traceback
-                logger.warning(f"Failed to fix step: {exc}")
-
     # Handle steps without assertions (non-testing steps)
     if not step.assertion and not step.verifications:
         # For non-testing steps, success is determined by execution success
@@ -540,41 +504,6 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
         if step.interface == "CLI":
             passed = result.ok  # result.ok is True when exit code is 0
             judgment_text = result.summary if not passed else "Command executed successfully"
-            
-            # If CLI command failed, trigger retry logic
-            if not passed:
-                step_key = f"{index}_cli"
-                attempt_counts = state.get("attempt_counts", {})
-                current_attempts = attempt_counts.get(step_key, 0)
-                max_retries = _retry_limit(state, deps)
-                
-                if current_attempts < max_retries:
-                    # Increment attempt count
-                    attempt_counts[step_key] = current_attempts + 1
-                    
-                    # Ask LLM to fix the step
-                    try:
-                        fixed_step = deps.planner.fix_step(step.model_dump(), judgment_text, current_attempts)
-                        
-                        # Update the matrix with the fixed step
-                        matrix[index] = fixed_step
-                        
-                        # Set status to retrying
-                        views = _views(state)
-                        _set_status(views, index, "retrying", assertion_passed=None, summary=f"Retry {current_attempts + 1}/{max_retries}: {judgment_text}")
-                        
-                        return {
-                            "phase": "execute_cli",  # Retry the CLI execution
-                            "test_matrix": _matrix_dump(matrix),
-                            "attempt_counts": attempt_counts,
-                            "step_views": _store_views(views),
-                        }
-                    except Exception as exc:  # noqa: BLE001
-                        # If fixing fails, proceed to failure
-                        import traceback
-                        error_msg = f"Failed to fix step: {exc}\n{traceback.format_exc()}"
-                        judgment_text = f"{judgment_text}\n\n{error_msg}"
-            
             results: list[VerificationResult] = []
             results.append(VerificationResult(
                 question="Command execution",
@@ -660,14 +589,14 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
         )
         
         if step.interface == "CLI":
-            judged = _judged_or_unreadable(deps, question, _command_text(evidence))
+            judged = _cli_verification(deps, question, result, evidence)
             results.append(
                 VerificationResult(question=question, passed=judged.passed, judgment=judged.judgment)
             )
             judgments.append(judged.judgment)
             passed = passed and judged.passed
         elif step.interface == "CODING":
-            judged = _judged_or_unreadable(deps, question, result.summary or output)
+            judged = _judged_or_unreadable(deps, question, _coding_text(evidence))
             results.append(
                 VerificationResult(question=question, passed=judged.passed, judgment=judged.judgment)
             )
@@ -703,6 +632,8 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
         }
     )
     if passed:
+        attempt_counts = dict(state.get("attempt_counts") or {})
+        attempt_counts[f"{index}_{step.interface.lower()}"] = 0
         _set_status(
             views,
             index,
@@ -716,30 +647,12 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
         return {
             "phase": "route",
             "current_step": index + 1,
+            "attempt_counts": attempt_counts,
             "step_views": _store_views(views),
             "execution_history": history,
             "last_result": result.model_copy(update={"assertion_passed": True}).model_dump(),
         }
-    attempts = dict(state.get("attempt_counts", {}))
-    key = str(index)
-    attempts[key] = attempts.get(key, 0) + 1
-    if attempts[key] <= _retry_limit(state, deps):
-        _set_status(
-            views,
-            index,
-            "retrying",
-            assertion_passed=False,
-            judgment=judgment_text,
-            verification_results=results,
-            summary=result.summary,
-            evidence=evidence,
-        )
-        return {
-            "phase": "reflect",
-            "attempt_counts": attempts,
-            "step_views": _store_views(views),
-            "execution_history": history,
-        }
+    reason = judgment_text or result.summary or f"Step {step.step} did not satisfy {step.assertion}"
     _set_status(
         views,
         index,
@@ -759,7 +672,7 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
         "phase": "finish",
         "reason_code": "assertion_failed",
         "reason": reason,
-        "attempt_counts": attempts,
+        "attempt_counts": dict(state.get("attempt_counts") or {}),
         "step_views": _store_views(views),
         "execution_history": history,
     }

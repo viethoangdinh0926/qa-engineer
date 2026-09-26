@@ -169,6 +169,10 @@ function setBusy(busy) {
   renderChatMessages();
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
+}
+
 function executing(run) {
   return Boolean(run && !run.ready && (run.status === "running" || run.status === "working"));
 }
@@ -202,6 +206,12 @@ function stepDetails(step, detailed) {
     operations.className = "summary";
     operations.textContent = step.operation_notes.map((note, index) => `${index + 1}. ${note}`).join("\n");
     body.append(operations);
+  }
+  if (step.interface === "CLI" && step.script) {
+    const script = document.createElement("pre");
+    script.className = "evidence";
+    script.textContent = step.script;
+    body.append(script);
   }
   // Show coding operations for CODING steps
   if (step.interface === "CODING" && step.coding_operations && step.coding_operations.length) {
@@ -379,8 +389,16 @@ function upsertRun(snapshot) {
     state.runs[index] = snapshot;
   }
   paintRuns();
-  if (snapshot.id === state.currentRunId && state.currentPlan) {
+  if (snapshot.id !== state.currentRunId) {
+    return;
+  }
+  if (snapshot.plan) {
+    state.currentPlan = snapshot.plan;
     renderPlan();
+    return;
+  }
+  if (state.currentPlan) {
+    loadPlan(snapshot.id);
   }
 }
 
@@ -610,6 +628,12 @@ function renderPlan() {
       <h4>Phase ${phase.phase}: ${phase.name}</h4>
       <p><strong>Interface:</strong> ${phase.interface}</p>
       <p><strong>Depends on:</strong> ${(phase.depends_on || []).join(", ") || "None"}</p>
+      <p><strong>Operations:</strong></p>
+      <ul>
+        ${(phase.operation_notes || []).map((note) => `<li>${note}</li>`).join("")}
+        ${(phase.coding_operations || []).map((op) => `<li>${op.action}${op.file_path ? `: ${op.file_path}` : ""}</li>`).join("")}
+      </ul>
+      ${phase.interface === "CLI" && phase.script ? `<p><strong>Script:</strong></p><pre>${escapeHtml(phase.script)}</pre>` : ""}
       <p><strong>Verifications:</strong></p>
       <ul>
         ${(phase.verifications || []).map(v => `<li>${v}</li>`).join("")}

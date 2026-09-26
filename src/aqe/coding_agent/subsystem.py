@@ -100,6 +100,32 @@ class CodingSubsystem:
             "description": action.description,
         }
 
+    def _work_file(self, work_dir: Path, file_path: str) -> Path:
+        relative = Path(file_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise PiAgentError(
+                "coding_agent_failed",
+                f"File path is outside the work directory: {file_path}",
+            )
+        target = (work_dir / relative).resolve()
+        root = work_dir.resolve()
+        if target != root and root not in target.parents:
+            raise PiAgentError(
+                "coding_agent_failed",
+                f"File path is outside the work directory: {file_path}",
+            )
+        return target
+
+    def _written(self, action: CodingAction, target: Path, message: str) -> dict[str, Any]:
+        content = target.read_text(encoding="utf-8")
+        return {
+            "success": True,
+            "action": action.action,
+            "message": message,
+            "file_path": action.file_path,
+            "content": content,
+        }
+
     def _execute_via_subprocess(self, action: CodingAction, run_id: str) -> dict[str, Any]:
         """Execute coding action via subprocess (simplified implementation)."""
         # Use work_dir directly as the base directory for files
@@ -110,19 +136,15 @@ class CodingSubsystem:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         if action.action == "create_file":
-            if not action.file_path or not action.content:
+            if not action.file_path or action.content is None:
                 raise PiAgentError(
                     "coding_agent_failed",
                     "create_file action requires file_path and content",
                 )
-            file_path = work_dir / action.file_path
+            file_path = self._work_file(work_dir, action.file_path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(action.content, encoding="utf-8")
-            return {
-                "success": True,
-                "message": f"Created file: {action.file_path}",
-                "file_path": str(file_path),
-            }
+            return self._written(action, file_path, f"Created file: {action.file_path}")
 
         elif action.action == "update_file":
             if not action.file_path:
@@ -130,19 +152,15 @@ class CodingSubsystem:
                     "coding_agent_failed",
                     "update_file action requires file_path",
                 )
-            file_path = work_dir / action.file_path
+            file_path = self._work_file(work_dir, action.file_path)
             if not file_path.exists():
                 raise PiAgentError(
                     "coding_agent_failed",
                     f"File not found: {action.file_path}",
                 )
-            if action.content:
+            if action.content is not None:
                 file_path.write_text(action.content, encoding="utf-8")
-            return {
-                "success": True,
-                "message": f"Updated file: {action.file_path}",
-                "file_path": str(file_path),
-            }
+            return self._written(action, file_path, f"Updated file: {action.file_path}")
 
         elif action.action == "review_code":
             if not action.file_path:
@@ -150,20 +168,13 @@ class CodingSubsystem:
                     "coding_agent_failed",
                     "review_code action requires file_path",
                 )
-            file_path = work_dir / action.file_path
+            file_path = self._work_file(work_dir, action.file_path)
             if not file_path.exists():
                 raise PiAgentError(
                     "coding_agent_failed",
                     f"File not found for review: {action.file_path}",
                 )
-            content = file_path.read_text(encoding="utf-8")
-            return {
-                "success": True,
-                "message": f"Reviewed file: {action.file_path}",
-                "file_path": str(file_path),
-                "content": content,
-                "line_count": len(content.splitlines()),
-            }
+            return self._written(action, file_path, f"Reviewed file: {action.file_path}")
 
         elif action.action == "execute_code":
             # Code execution is now handled by CLI steps, not CODING steps
@@ -201,16 +212,18 @@ class CodingSubsystem:
                 errors.append(str(exc))
                 results.append({
                     "success": False,
-                    "error": str(exc),
                     "action": operation.action,
+                    "file_path": operation.file_path,
+                    "error": str(exc),
                 })
             except Exception as exc:  # noqa: BLE001
                 # Catch any unexpected errors to prevent engine_error
                 errors.append(f"Unexpected error: {exc}")
                 results.append({
                     "success": False,
-                    "error": str(exc),
                     "action": operation.action,
+                    "file_path": operation.file_path,
+                    "error": str(exc),
                 })
 
         # Note: Pi agent cleanup not needed for simplified implementation

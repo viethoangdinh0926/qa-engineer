@@ -14,6 +14,32 @@ from aqe.state import ActionResult, TestStep
 logger = logging.getLogger(__name__)
 
 
+def _bash_quote(path: Path) -> str:
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
+def _bash_runner(script_path: Path, result_path: Path) -> str:
+    """Source the phase script and record shell state when that shell exits.
+
+    python -m venv and source print nothing, and VIRTUAL_ENV disappears with the
+    shell. The EXIT trap writes those facts before the process ends.
+    """
+    result = _bash_quote(result_path)
+    script = _bash_quote(script_path)
+    return (
+        "set +e\n"
+        "trap '__aqe_status=$?\n"
+        "{\n"
+        'printf "script_exit=%s\\n" "$__aqe_status"\n'
+        'printf "VIRTUAL_ENV=%s\\n" "${VIRTUAL_ENV-}"\n'
+        'if [ -d venv ]; then printf "venv_dir=present\\n"; else printf "venv_dir=absent\\n"; fi\n'
+        'if [ -x venv/bin/python ]; then printf "venv_python=present\\n"; else printf "venv_python=absent\\n"; fi\n'
+        f"}} > {result}\n"
+        "' EXIT\n"
+        f"source {script}\n"
+    )
+
+
 def ensure_container_name_available(container_name: str) -> bool:
     """Check if a container name is available and remove existing container if needed."""
     try:
@@ -264,16 +290,13 @@ class CLISubsystem:
             return "", f"Host execution failed: {e!s}", 1
 
     def execute_runtime_action(self, step: TestStep, evidence_dir: Path) -> ActionResult:
-        # Only use the action for script generation, not the verifications
-        # Verifications are checked separately after execution
-        intent = step.action
-        
-        # Clean up the action: replace periods used as command separators with &&
-        # This handles cases where LLM uses "." instead of "&&" or ";"
-        # Pattern: "command1. command2" -> "command1 && command2"
-        # But avoid matching periods after shell operators like &, |, ;, &&, ||
-        intent = re.sub(r'(?<![&|;])\.\s+(?=\S)', ' && ', intent)
-        
+        work_dir = self.work_dir if self.work_dir.is_absolute() else self.work_dir.resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        if step.script.strip():
+            return self._run_bash(step.script, work_dir)
+
+        notes = [note.strip() for note in step.operation_notes if note and note.strip()]
+        intent = "\n".join(notes) if notes else step.action
         script = self.planner.script_for(intent)
         # An absolute directory keeps script.py from being resolved against itself.
         work_dir = self.work_dir if self.work_dir.is_absolute() else self.work_dir.resolve()
@@ -351,3 +374,49 @@ class CLISubsystem:
                     summary=f"Python script execution failed: {e}",
                     evidence={"stdout": "", "stderr": str(e), "execution_type": "host", "exit_code": 1},
                 )
+
+    def _run_bash(self, script: str, work_dir: Path) -> ActionResult:
+        """Run the CLI phase's bash script in the run work directory."""
+        text = script if script.endswith("\n") else f"{script}\n"
+        script_path = work_dir / "script.sh"
+        script_path.write_text(text, encoding="utf-8")
+        result_path = work_dir / "aqe-script-result.txt"
+        runner_path = work_dir / "script-runner.sh"
+        runner_path.write_text(_bash_runner(script_path, result_path), encoding="utf-8")
+        try:
+            result = subprocess.run(
+                ["bash", str(runner_path)],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return ActionResult(
+                ok=False,
+                summary="Bash script timed out",
+                evidence={"stdout": "", "stderr": "Script timed out", "execution_type": "host", "exit_code": 124},
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return ActionResult(
+                ok=False,
+                summary=f"Bash script execution failed: {exc}",
+                evidence={"stdout": "", "stderr": str(exc), "execution_type": "host", "exit_code": 1},
+            )
+        stdout = result.stdout
+        stderr = result.stderr
+        summary = stdout.strip() or stderr.strip() or "Bash script executed."
+        script_result = result_path.read_text(encoding="utf-8") if result_path.is_file() else ""
+        return ActionResult(
+            ok=result.returncode == 0,
+            summary=summary,
+            evidence={
+                "stdout": stdout,
+                "stderr": stderr,
+                "summary": summary,
+                "execution_type": "host",
+                "exit_code": result.returncode,
+                "script_result": script_result,
+            },
+        )

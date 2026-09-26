@@ -290,7 +290,7 @@ class RunService:
             record.done.wait(timeout=0.05)
 
     def snapshot(self, record: RunRecord) -> dict[str, Any]:
-        return {
+        payload = {
             "id": record.id,
             "status": record.status,
             "ready": record.ready,
@@ -299,6 +299,10 @@ class RunService:
             "report": record.report,
             "execution_history": record.execution_history,
         }
+        plan = PlanStorageManager(self.config.runs_dir).load_plan(record.id)
+        if plan is not None:
+            payload["plan"] = plan.model_dump(mode="json")
+        return payload
 
     def run_dir(self, run_id: str) -> Path:
         return self.config.runs_dir / run_id

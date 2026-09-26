@@ -70,6 +70,7 @@ class TestPhase(BaseModel):
     depends_on: list[int] = Field(default_factory=list)
     operations: list[GUIAction] = Field(default_factory=list)
     operation_notes: list[str] = Field(default_factory=list)
+    script: str = ""
     verifications: list[str] = Field(default_factory=list)
     coding_operations: list[CodingAction] = Field(default_factory=list)
 
@@ -96,6 +97,7 @@ class TestStep(BaseModel):
     phase_name: str | None = None
     depends_on: list[int] = Field(default_factory=list)
     operation_notes: list[str] = Field(default_factory=list)
+    script: str = ""
     verifications: list[str] = Field(default_factory=list)
     coding_operations: list[CodingAction] = Field(default_factory=list)
 
@@ -160,6 +162,7 @@ class StepView(BaseModel):
     phase_name: str | None = None
     depends_on: list[int] = Field(default_factory=list)
     operation_notes: list[str] = Field(default_factory=list)
+    script: str = ""
     verification_results: list[VerificationResult] = Field(default_factory=list)
     coding_operations: list[CodingAction] = Field(default_factory=list)
 
@@ -177,6 +180,7 @@ class StepView(BaseModel):
             phase_name=step.phase_name,
             depends_on=list(step.depends_on),
             operation_notes=list(step.operation_notes),
+            script=step.script,
             verification_results=[VerificationResult(question=question) for question in questions],
             coding_operations=list(step.coding_operations),
         )

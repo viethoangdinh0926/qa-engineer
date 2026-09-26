@@ -4,8 +4,9 @@ import json
 import logging
 import re
 import shlex
+from collections.abc import Callable
 from pathlib import PurePath
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -14,6 +15,19 @@ from aqe.config import EngineConfig
 from aqe.state import CodingAction, GUIAction, PlanResult, TestPhase, TestStep
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+def invoke_json(model: BaseChatModel, messages: list, parser: Callable[[str], T]) -> tuple[T, str]:
+    """Send one query and parse the reply as JSON."""
+    message = model.invoke(messages)
+    content = message.content if isinstance(message.content, str) else str(message.content)
+    try:
+        return parser(content), content
+    except Exception as exc:
+        logger.warning("Model reply was not valid JSON: %s", exc)
+        raise ValueError(str(exc)) from exc
 
 NONSENSE_SPEC = "Hello, this is not a test specification."
 
@@ -116,6 +130,11 @@ _AGENT_CAPABILITIES = (
     "is a CODING phase. The Pi coding agent runs it through coding_operations "
     "(create_file, update_file, or review_code), each with file_path, content, and description. "
     "Do not turn that request into a CLI command such as cat, tee, or python -c. "
+    "The host CLI can start a process and call a network endpoint, including curl against a local health URL. "
+    "A request to create an API or service and verify that it is running is accepted. "
+    "Generate the source in a CODING phase. "
+    "Start the process in the background and run the health check in a later CLI phase that depends on the CODING phase. "
+    "Do not reject that request because the generated code must be executed, a server must be started, or a live endpoint must be called. "
     "If the request cannot be tested with the browser, CLI tools, or the Pi coding agent, "
     "set accepted to false and explain that mismatch in reason. "
 )
@@ -129,21 +148,32 @@ _PLAN_SYSTEM = (
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Each phase is a chain of operations followed by the verifications of those operations. "
     "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
-    "interface (GUI, CLI, or CODING), gui_driver (browser or null), operations, coding_operations, and verifications. "
+    "interface (GUI, CLI, or CODING), gui_driver (browser or null), operations, script, coding_operations, and verifications. "
     "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
-    "CLI operations are strings. "
+    "A CLI phase sets interface to CLI and puts the whole bash script in script. "
+    "script is one string the agent runs with bash. Include every command, in order, with newlines escaped as \\n. "
+    "Use set -e so a failing command stops the script. "
+    "source, &&, and a trailing & belong in that script. Do not describe the commands in prose. "
     "CODING operations are objects with action create_file, update_file, or review_code, plus file_path, content, and description. "
     "When the user asks for a CODING phase, or asks the agent to generate code or files, that phase uses interface CODING "
     "and coding_operations. It does not use interface CLI. "
     "GUI verifications are questions about the page after the operations. "
-    "CLI verifications are questions about the command output. "
+    "A CLI verification is decided only from $? , stdout, and stderr after that phase's script runs. "
+    "The script must print the evidence the check needs. "
+    "Each CLI verification names what $? , stdout, or stderr must show, in one or two sentences. "
+    "Do not write a vague check such as 'the background service is running', "
+    "'the log is available for later inspection', 'a process is present', or 'the service is listening'. "
+    "If a service is started in the background, the same script must then print proof, for example by calling curl on the health URL. "
+    "The verification then says what that command produced, such as '$? is 0 and stdout is OK.' "
     "CODING verifications are questions about the files the Pi coding agent wrote. "
+    "Name the file and what it should contain. "
+    "The check is judged from the file that was written, not from a message that the operation succeeded. "
     "Write every verification as one or two complete sentences. Be specific and verbose. "
     "Keep the original meaning of the user's check. Do not add a condition they did not ask for, and do not drop one they did. "
     "Do not shorten a check into contains:, json:, or status:. "
     "If the user says a command returns nothing or mentions its output, say whether stdout is empty. "
-    "Do not add a stdout content check unless the user mentions stdout, standard output, or the command output. "
-    "Mention stderr only when the user mentions an error, issue, exception, warning, failure, traceback, or stderr. "
+    "Express a CLI check as a claim about $? , stdout, or stderr that the script prints. "
+    "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr. "
     "Example: 'Run ls. Verify that it returns nothing.' has verification "
     "'The ls command returns nothing. stdout is empty. A successful exit code does not satisfy this check.' "
     "Example: 'Run curl and verify that it reports an error.' has verification "
@@ -154,13 +184,6 @@ _PLAN_SYSTEM = (
     "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for any test step. "
     "All CLI operations must run directly in the host environment without containers. "
     "Do not instruct the agent to start containers, use docker commands, or containerize any part of the test execution. "
-    "IMPORTANT: When starting a long-running service (e.g., using nohup, backgrounding with &, or starting a server), "
-    "you MUST include a verification step to confirm the service started successfully and is still running. "
-    "For example, after 'nohup python app.py > service.log 2>&1 &', add a verification like "
-    "'A python process running app.py is present, indicating that the API service has started successfully.' "
-    "Or check the log file: 'The service.log file exists and contains no error messages, indicating the service started without crashing.' "
-    "Or check if the service is listening: 'The service is listening on the expected port, indicating it started successfully.' "
-    "This ensures that service startup failures or crashes are detected. "
     "Every phase needs at least one verification. "
     "Put a phase that needs another phase's result after that phase, and list it in depends_on. "
     "One page visit is one GUI phase. Navigation, typing, and the click are that phase's operations. "
@@ -186,13 +209,17 @@ _REPAIR_SYSTEM = (
     + "Revise the testing plan so every phase is executable with the browser, a CLI command, or the Pi coding agent. "
     "Keep a requested CODING phase as interface CODING with coding_operations. "
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
-    "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, coding_operations, and verifications. "
+    "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, script, coding_operations, and verifications. "
+    "A CLI phase must include script, the complete bash script. "
+    "A CLI verification is decided only from $? , stdout, and stderr. "
+    "The script must print the evidence, and the verification must say what $? , stdout, or stderr must show. "
+    "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'. "
     "verifications must be strings. "
     "Every check the request asks for must appear as a verification written as one or two complete sentences. "
     "Be verbose and keep the original meaning. Do not shorten a check into contains:, json:, or status:. "
     "A command that should return nothing is described as empty stdout, not as an exit code. "
-    "Do not add a stdout content check unless the user mentions stdout, standard output, or the command output. "
-    "Mention stderr only when the user mentions an error, issue, exception, warning, failure, traceback, or stderr. "
+    "Express a CLI check as a claim about $? , stdout, or stderr that the script prints. "
+    "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr. "
     "A page check belongs on the GUI phase whose operations produce that page. Never make the check its own phase. "
     "A file, webhook, or command check is a later CLI phase whose depends_on lists the phase that produced it. "
     "Coding operations (create_file, update_file, review_code, execute_code) belong in CODING phases. "
@@ -214,6 +241,8 @@ _REJECT_SYSTEM = (
     "or a check needs a result the request never produces. "
     "CODING operations (create_file, update_file, review_code, execute_code) ARE valid test operations. "
     "Do not reject a request just because it involves writing code or creating files. "
+    "Do not say the agent cannot start a server, execute generated code, or call a health endpoint. "
+    "Those steps are a CLI phase after the CODING phase that writes the service. "
     "Do not call it a contradiction when the request opens a page, fills a field, clicks a button, "
     "and then checks the page text. That is one GUI phase, with the check after the click. "
     "Do not talk about a verification phase that has no operations."
@@ -257,13 +286,13 @@ _FIX_STEP_SYSTEM = (
     "- Network errors indicating the service is not running on the expected port "
     "- File not found errors for files that don't exist and cannot be created "
     "- Service startup failures that indicate the service cannot run (e.g., 'ModuleNotFoundError' for required modules) "
-    "If the error is a hard failure, set 'should_retry' to false and explain why in the judgment. "
-    "If the error can be fixed (e.g., wrong file path, wrong command name, syntax error, timeout too short), "
-    "set 'should_retry' to true and provide the corrected step. "
+    "If the error is a hard failure, set should_retry to false and explain why in judgment, in one or two sentences. "
+    "If the error can be fixed, set should_retry to true and provide the corrected step. "
+    "The step is retried at most 3 times, and only when should_retry is true. "
     "Reply with one JSON object only. "
-    "If should_retry is true, include the corrected step with these fields: step, interface, gui_driver, action, assertion, verifications, operations, coding_operations. "
+    "If should_retry is true, include the corrected step with these fields: step, interface, gui_driver, action, assertion, verifications, operations, script, coding_operations. "
     "Keep the same step number and interface. "
-    "Fix the action, operations, or coding_operations to address the error. "
+    "For a CLI step, script is the whole bash script to run. Replace that script to fix the failure. "
     "Common fixes: "
     "- If file not found: correct the file path or create the file first "
     "- If command not found: use the correct command name or install the tool "
@@ -278,77 +307,41 @@ _FIX_STEP_SYSTEM = (
 
 _REFINE_PLAN_SYSTEM = (
     _AGENT_CAPABILITIES
-    + "You are a test planning assistant. Users may ask you questions about the current plan or request changes to it.\n\n"
-    "If the user asks a question (e.g., 'Why did you include this step?', 'Explain phase 2', 'What does this verification check?'), "
-    "provide a clear, helpful answer about the current plan. Return JSON with:\n"
-    "{\n"
-    "  \"type\": \"answer\",\n"
-    "  \"answer\": \"your explanation here\"\n"
-    "}\n\n"
-    "If the user requests changes (e.g., 'Add a verification for X', 'Remove step 3', 'Change the approach'), "
-    "refine the plan accordingly. Return JSON with:\n"
-    "{\n"
-    "  \"type\": \"plan_update\",\n"
-    "  \"phases\": [\n"
-    "    {\n"
-    "      \"phase\": integer (phase number),\n"
-    "      \"name\": string (phase name),\n"
-    "      \"interface\": \"GUI\", \"CLI\", or \"CODING\",\n"
-    "      \"gui_driver\": \"browser\" or null,\n"
-    "      \"depends_on\": [list of phase numbers],\n"
-    "      \"operations\": [\n"
-    "        {\n"
-    "          \"action\": \"click\", \"type\", \"press\", or \"goto\",\n"
-    "          \"coordinate\": [x, y] or null,\n"
-    "          \"selector\": {\"role\": \"textbox\", \"name\": \"field_name\"} or null,\n"
-    "          \"text\": string or null\n"
-    "        }\n"
-    "      ],\n"
-    "      \"coding_operations\": [\n"
-    "        {\n"
-    "          \"action\": \"create_file\", \"update_file\", \"review_code\", or \"execute_code\",\n"
-    "          \"file_path\": string (file path),\n"
-    "          \"content\": string (file content),\n"
-    "          \"description\": string (description)\n"
-    "        }\n"
-    "      ],\n"
-    "      \"verifications\": [list of verification strings]\n"
-    "    }\n"
-    "  ],\n"
-    "  \"steps\": [\n"
-    "    {\n"
-    "      \"step\": integer (step number),\n"
-    "      \"interface\": \"GUI\", \"CLI\", or \"CODING\",\n"
-    "      \"gui_driver\": \"browser\" or null,\n"
-    "      \"action\": string (action description),\n"
-    "      \"assertion\": string (assertion),\n"
-    "      \"verifications\": [list of verification strings],\n"
-    "      \"operations\": [\n"
-    "        {\n"
-    "          \"action\": \"click\", \"type\", \"press\", or \"goto\",\n"
-    "          \"coordinate\": [x, y] or null,\n"
-    "          \"selector\": {\"role\": \"textbox\", \"name\": \"field_name\"} or null,\n"
-    "          \"text\": string or null\n"
-    "        }\n"
-    "      ],\n"
-    "      \"coding_operations\": [\n"
-    "        {\n"
-    "          \"action\": \"create_file\", \"update_file\", \"review_code\", or \"execute_code\",\n"
-    "          \"file_path\": string (file path),\n"
-    "          \"content\": string (file content),\n"
-    "          \"description\": string (description)\n"
-    "        }\n"
-    "      ]\n"
-    "    }\n"
-    "  ],\n"
-    "  \"reasoning\": string (explanation of changes)\n"
-    "}\n\n"
-    "CRITICAL: For plan updates, use 'phase' (not 'id') for the phase number. Always include 'interface' field. "
-    "GUI operations are objects. CLI operations are command strings. "
-    "When the user asks for a CODING phase or for generated code or files, set interface to CODING and fill coding_operations. "
-    "Do not turn that request into a CLI phase. Do not add a desktop phase. Desktop applications are not tested. "
-    "Return every phase. Keep each phase number. Changing one phase must leave the others in the plan. "
-    "Omit a phase only when the user asked to remove that phase."
+    + "You are a test planning assistant. The user may ask a question about the current plan or ask you to change it. "
+    "Reply with one valid JSON object and nothing else. "
+    "Do not add prose, markdown, or a code fence around it. "
+    "Use double quotes for every key and string. "
+    "Escape quotation marks and newlines inside strings. "
+    "Do not use comments or trailing commas. "
+    "If the user asks a question, return "
+    '{"type": "answer", "answer": "the answer in sentences"}. '
+    "If the user asks to change the plan, return the complete plan that should exist after the change: "
+    '{"type": "plan_update", "reasoning": "one or two sentences", "phases": []}. '
+    "Each phase has phase, name, interface, depends_on, operation_notes, script, verifications, and coding_operations. "
+    "phase is a whole number: 1, then 2, then 3. Never use a decimal such as 1.5. "
+    "To insert a phase, renumber every later phase. "
+    "interface is GUI, CLI, or CODING. "
+    "A GUI phase sets gui_driver to browser. "
+    "A CLI phase sets script to the complete bash script, with newlines escaped as \\n. "
+    "Do not put the commands in prose. "
+    "A CLI verification names what $? , stdout, or stderr must show after the script runs. "
+    "The script must print that evidence. "
+    "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'. "
+    "Each CLI script starts a new shell. source does not carry into the next phase. "
+    "A later phase that needs the virtual environment must source it again at the start of its script, "
+    "or call venv/bin/pip and venv/bin/python. "
+    "The phases array is the complete plan after the change. "
+    "The agent stores that list as the plan. "
+    "Include every phase that should still run, with its script or its file content. "
+    "When the user asks to remove or merge phases, leave those phases out of the list and fix depends_on so every dependency is a phase in the list. "
+    "A CODING phase puts create_file, update_file, or review_code objects in coding_operations, "
+    "each with action, file_path, content, and description."
+)
+
+_VALID_JSON_SYSTEM = (
+    "Reply with one valid JSON object and nothing else. "
+    "Use double quotes. Escape quotation marks and newlines inside strings. "
+    "Do not use comments, trailing commas, or a markdown fence."
 )
 
 _NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat", "pip", "pip3", "npm", "npm install", "apt", "apt-get", "yum", "dnf"})
@@ -585,12 +578,27 @@ _INCOMPLETE_REASON = ("assum", "implicit", "omit", "skip", "not included", "no i
 _REFUSED_TO_PLAN = (
     "do not have the capability",
     "cannot execute",
+    "cannot be executed",
     "cannot construct",
     "as an llm",
     "i cannot",
     "i do not",
     "cannot browse",
     "cannot access",
+    "start a server",
+    "network endpoint",
+    "live network",
+    "health check",
+    "available tools",
+)
+
+_SERVICE_PIPELINE = (
+    "Host CLI tools start a process and call a network endpoint. "
+    "Generate the service source in a CODING phase with coding_operations. "
+    "Start that process in the background, then in that same CLI phase or a later CLI phase print proof with a concrete command such as curl. "
+    "The verification names $? and the stdout of that command. "
+    "Use a concrete port. "
+    "Do not reject the request because the generated code must run or a live endpoint must be called. "
 )
 
 
@@ -651,6 +659,111 @@ def _depends_on(raw: object) -> list[int]:
     return list(dict.fromkeys(numbers))
 
 
+_CODING_ACTION_ALIASES = {
+    "write_file": "create_file",
+    "create_file": "create_file",
+    "update_file": "update_file",
+    "edit_file": "update_file",
+    "modify_file": "update_file",
+    "review_code": "review_code",
+    "execute_code": "execute_code",
+    "execute_command": "execute_code",
+    "execute_shell": "execute_code",
+    "run_command": "execute_code",
+    "run_code": "execute_code",
+    "make_executable": "execute_code",
+    "run": "execute_code",
+}
+
+
+def _coding_action_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return _CODING_ACTION_ALIASES.get(value.strip().lower())
+
+
+def _normalize_coding_operation(raw: dict) -> dict | None:
+    """Read a coding operation when the model uses a nearby field name or nests the action."""
+    op = dict(raw)
+    if "action" not in op:
+        nested = [
+            key
+            for key, value in op.items()
+            if _coding_action_name(key) and isinstance(value, dict)
+        ]
+        if len(nested) == 1 and len(op) == 1:
+            key = nested[0]
+            op = dict(op[key])
+            op["action"] = _coding_action_name(key)
+        else:
+            for alias in ("coding_operation", "coding_action", "operation", "type", "op"):
+                if alias in op:
+                    op["action"] = op.pop(alias)
+                    break
+    if "command" in op and "action" not in op:
+        op["action"] = "execute_code"
+        op["content"] = op.pop("command")
+    if not op.get("file_path"):
+        for key in ("path", "file", "filename", "filepath"):
+            if isinstance(op.get(key), str) and op[key].strip():
+                op["file_path"] = op.pop(key)
+                break
+    if op.get("content") is None:
+        for key in ("code", "text", "body", "source"):
+            if isinstance(op.get(key), str):
+                op["content"] = op.pop(key)
+                break
+    action = _coding_action_name(op.get("action")) or _infer_coding_action(op)
+    if action is None:
+        return None
+    op["action"] = action
+    return op
+
+
+def _infer_coding_action(op: dict) -> str | None:
+    """A file and its content are a create when the model omits the action name."""
+    description = str(op.get("description") or "")
+    has_content = isinstance(op.get("content"), str)
+    has_path = isinstance(op.get("file_path"), str) and bool(op["file_path"].strip())
+    if re.search(r"\breview\b", description, re.IGNORECASE) and not has_content:
+        return "review_code"
+    if re.search(r"\b(update|edit|modify)\b", description, re.IGNORECASE) and has_path:
+        return "update_file"
+    if has_content or re.search(r"\b(create|write|add)\b", description, re.IGNORECASE):
+        return "create_file"
+    if has_path:
+        return "review_code"
+    return None
+
+
+def _coding_operations_from(raw: object) -> list[CodingAction]:
+    items = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+    operations: list[CodingAction] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_coding_operation(item)
+        if normalized is None:
+            logger.warning(f"Failed to validate coding operation: {item}")
+            continue
+        try:
+            operations.append(CodingAction.model_validate(normalized))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to validate coding operation: {exc}")
+    return operations
+
+
+def _bash_script(raw: object, notes: list[str]) -> str:
+    """The bash program for a CLI phase. A missing script is built from command notes."""
+    if isinstance(raw, str) and raw.strip():
+        text = _strip_fence(raw).strip()
+        return text if text.endswith("\n") else f"{text}\n"
+    command = command_from_intent("\n".join(notes))
+    if not command:
+        return ""
+    return f"set -e\n{command}\n"
+
+
 def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
     phases: list[TestPhase] = []
     problems: list[str] = []
@@ -661,6 +774,8 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
         number = _phase_number(item.get("phase") or item.get("id"), index)
         name = str(item.get("name") or item.get("title") or "").strip()
         notes, actions = _split_operations(item.get("operations") or item.get("operation"))
+        if not notes:
+            notes = _string_list(item.get("operation_notes"))
         verifications = _string_list(item.get("verifications") or item.get("verification") or item.get("assertions"))
         if not name:
             name = notes[0] if notes else f"Phase {number}"
@@ -668,49 +783,9 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
         driver = item.get("gui_driver")
         driver_name = str(driver).strip().lower() if isinstance(driver, str) and driver.strip() else None
 
-        # Handle coding operations
-        coding_operations_raw = item.get("coding_operations") or []
-        coding_operations = []
-        if isinstance(coding_operations_raw, list):
-            for op in coding_operations_raw:
-                if isinstance(op, dict):
-                    # Fix common LLM mistakes: rename 'operation' to 'action'
-                    if "operation" in op and "action" not in op:
-                        op = dict(op)
-                        op["action"] = op.pop("operation")
-                    # Fix common LLM mistakes: rename 'type' to 'action'
-                    if "type" in op and "action" not in op:
-                        op = dict(op)
-                        op_type = op.pop("type")
-                        # Map common type values to action values
-                        type_to_action = {
-                            "write_file": "create_file",
-                            "create_file": "create_file",
-                            "update_file": "update_file",
-                            "edit_file": "update_file",
-                            "modify_file": "update_file",
-                            "review_code": "review_code",
-                            "execute_code": "execute_code",
-                            "execute_command": "execute_code",
-                            "run_code": "execute_code",
-                            "make_executable": "execute_code",  # Treat as execute_code with chmod
-                        }
-                        op["action"] = type_to_action.get(op_type, op_type)
-                    # Fix common LLM mistakes: rename 'execute_command' to 'execute_code'
-                    if op.get("action") == "execute_command":
-                        op = dict(op)
-                        op["action"] = "execute_code"
-                    # Fix common LLM mistakes: rename 'command' to 'action' (for execute_code)
-                    if "command" in op and "action" not in op:
-                        op = dict(op)
-                        op["action"] = "execute_code"
-                        # Keep the command in a separate field if needed
-                        if "command" in op:
-                            op["content"] = op.pop("command")
-                    try:
-                        coding_operations.append(CodingAction.model_validate(op))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(f"Failed to validate coding operation: {exc}")
+        coding_operations = _coding_operations_from(item.get("coding_operations") or [])
+        if not coding_operations:
+            coding_operations = _coding_operations_from(item.get("operations") or [])
 
         # Auto-detect interface if not specified
         if interface not in {"GUI", "CLI", "CODING"}:
@@ -733,12 +808,18 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
             driver_name = None
         if interface == "CLI" and not verifications and notes:
             verifications = list(notes)
-        if interface == "CLI" and verifications and not notes and not actions:
+        script = _bash_script(
+            item.get("script") or item.get("bash") or item.get("bash_script") or item.get("shell"),
+            notes,
+        )
+        if interface == "CLI" and verifications and not notes and not actions and not script.strip():
             notes = [f"Carry out: {item}" for item in verifications]
         if interface == "CODING" and not verifications and notes:
             verifications = list(notes)
         if interface == "CODING" and verifications and not notes and not coding_operations:
             notes = [f"Carry out: {item}" for item in verifications]
+        if interface == "CLI" and not script.strip():
+            script = _bash_script("", notes)
 
         phases.append(
             TestPhase(
@@ -749,6 +830,7 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
                 depends_on=_depends_on(item.get("depends_on") or item.get("after")),
                 operations=[GUIAction.model_validate(action) for action in actions],
                 operation_notes=notes,
+                script=script if interface == "CLI" else "",
                 verifications=verifications,
                 coding_operations=coding_operations,
             )
@@ -865,7 +947,7 @@ def verbalize_verifications(specification: str, phases: list[TestPhase]) -> list
 
 
 def _has_work(phase: TestPhase) -> bool:
-    return bool(phase.operations or phase.operation_notes or phase.coding_operations)
+    return bool(phase.script.strip() or phase.operations or phase.operation_notes or phase.coding_operations)
 
 
 def fold_check_phases(phases: list[TestPhase]) -> list[TestPhase]:
@@ -936,40 +1018,18 @@ def _missing_coding_phase(text: str, phases: list[TestPhase]) -> str | None:
     )
 
 
-_REMOVE_PHASE = re.compile(
-    r"\b(?:remove|delete|drop)\s+(?:the\s+)?phase\s+(\d+)\b",
-    re.IGNORECASE,
-)
-_REPLACE_PLAN = re.compile(
-    r"\b(?:replace the (?:whole |entire )?plan|start over|discard (?:the )?other phases|keep only phase)\b",
-    re.IGNORECASE,
-)
-
-
-def _merge_phases(current: list[TestPhase], updated: list[TestPhase], feedback: str) -> list[TestPhase]:
-    """Apply returned phases onto the current plan without dropping phases the user did not remove."""
-    if _REPLACE_PLAN.search(feedback):
-        merged = {phase.phase: phase for phase in updated}
-    else:
-        merged = {phase.phase: phase for phase in current}
-        for phase in updated:
-            merged[phase.phase] = phase
-        for number in _REMOVE_PHASE.findall(feedback):
-            merged.pop(int(number), None)
-    return [merged[number] for number in sorted(merged)]
-
-
 def _apply_phase_update(
     current: list[TestPhase],
     raw_phases: list,
     feedback: str,
 ) -> tuple[list[TestPhase], list[TestStep], str | None]:
-    phases, problem = _coerce_phases(raw_phases)
+    """Store the phase list the model returned. The model decides which phases remain."""
+    del current
+    phases, problem = _coerce_phases(_integer_phases(raw_phases))
     if problem:
         return [], [], problem
     if not phases:
         return [], [], "The update did not include any phases."
-    phases = _merge_phases(current, phases, feedback)
     problem = _validate_phases(phases) or _missing_coding_phase(feedback, phases)
     if problem:
         return [], [], problem
@@ -977,6 +1037,38 @@ def _apply_phase_update(
     if order_problem:
         return [], [], order_problem
     return ordered, [_phase_to_step(phase) for phase in ordered], None
+
+
+def _integer_phases(raw: list) -> list:
+    """Give every phase a whole number, in the order the model listed them."""
+    if not raw or not all(isinstance(item, dict) for item in raw):
+        return raw
+    labels = [item.get("phase", item.get("id", index)) for index, item in enumerate(raw, start=1)]
+    numbers: list[int] = []
+    for label in labels:
+        if isinstance(label, bool) or isinstance(label, float) or not isinstance(label, (int, str)):
+            numbers = []
+            break
+        if isinstance(label, str) and not label.isdigit():
+            numbers = []
+            break
+        numbers.append(int(label))
+    if numbers and len(set(numbers)) == len(numbers):
+        return raw
+    mapping = {str(label): index for index, label in enumerate(labels, start=1)}
+    renumbered: list[dict] = []
+    for index, item in enumerate(raw, start=1):
+        updated = dict(item)
+        updated["phase"] = index
+        depends = updated.get("depends_on", updated.get("after", []))
+        if isinstance(depends, list):
+            updated["depends_on"] = [
+                mapping[str(dep)]
+                for dep in depends
+                if str(dep) in mapping and mapping[str(dep)] != index
+            ]
+        renumbered.append(updated)
+    return renumbered
 
 
 def _validate_phases(phases: list[TestPhase]) -> str | None:
@@ -988,7 +1080,9 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
     problems: list[str] = []
     for phase in phases:
         label = f"Phase {phase.phase} ({phase.name})"
-        has_operations = bool(phase.operation_notes or phase.operations or phase.coding_operations)
+        has_operations = bool(
+            phase.script.strip() or phase.operation_notes or phase.operations or phase.coding_operations
+        )
         if not has_operations:
             problems.append(
                 f"{label} has no operations. "
@@ -1131,6 +1225,7 @@ def _phase_to_step(phase: TestPhase) -> TestStep:
         phase_name=phase.name,
         depends_on=list(phase.depends_on),
         operation_notes=notes,
+        script=phase.script,
         verifications=checks,
         coding_operations=list(phase.coding_operations),
     )
@@ -1153,19 +1248,344 @@ def _repair_json(text: str) -> str:
     return text
 
 
+def _string_ends_here(text: str, quote_index: int) -> bool:
+    """A quote ends a JSON string when the next token is a comma or a closing brace."""
+    rest = text[quote_index + 1 :]
+    index = 0
+    while index < len(rest) and rest[index] in " \t\r\n":
+        index += 1
+    if index >= len(rest):
+        return True
+    char = rest[index]
+    if char == ",":
+        return True
+    if char in "}]":
+        index += 1
+        while index < len(rest) and rest[index] in " \t\r\n":
+            index += 1
+        return index >= len(rest) or rest[index] in ",}]"
+    return False
+
+
+def _key_ends_here(text: str, quote_index: int) -> bool:
+    """A quote ends a JSON key when the next token is a colon."""
+    rest = text[quote_index + 1 :]
+    index = 0
+    while index < len(rest) and rest[index] in " \t\r\n":
+        index += 1
+    return index >= len(rest) or rest[index] == ":"
+
+
+def _escape_interior_quotes(text: str) -> str:
+    """Escape quotes and line breaks that sit inside a JSON string, such as source code."""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    escape = False
+    role = "value"
+    stack: list[str] = []
+    expect = "value"
+
+    while index < length:
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+                out.append(char)
+                index += 1
+                continue
+            if char == "\\":
+                escape = True
+                out.append(char)
+                index += 1
+                continue
+            if char == '"':
+                ends = _key_ends_here(text, index) if role == "key" else _string_ends_here(text, index)
+                if ends:
+                    in_string = False
+                    expect = "colon" if role == "key" else "comma"
+                    out.append(char)
+                else:
+                    out.append('\\"')
+                index += 1
+                continue
+            if char == "\n":
+                out.append("\\n")
+                index += 1
+                continue
+            if char == "\r":
+                out.append("\\r")
+                index += 1
+                continue
+            if char == "\t":
+                out.append("\\t")
+                index += 1
+                continue
+            out.append(char)
+            index += 1
+            continue
+        if char.isspace():
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            role = "key" if expect == "key" else "value"
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char in "{[":
+            stack.append(char)
+            expect = "key" if char == "{" else "value"
+            out.append(char)
+            index += 1
+            continue
+        if char in "}]":
+            if stack:
+                stack.pop()
+            expect = "comma"
+            out.append(char)
+            index += 1
+            continue
+        if char == ":":
+            expect = "value"
+            out.append(char)
+            index += 1
+            continue
+        if char == ",":
+            expect = "key" if stack and stack[-1] == "{" else "value"
+            out.append(char)
+            index += 1
+            continue
+        if char == "-" or char.isdigit() or text.startswith(("true", "false", "null"), index):
+            if text.startswith("true", index):
+                token = "true"
+            elif text.startswith("false", index):
+                token = "false"
+            elif text.startswith("null", index):
+                token = "null"
+            else:
+                end = index + 1
+                while end < length and text[end] in "0123456789.eE+-":
+                    end += 1
+                token = text[index:end]
+            out.append(token)
+            index += len(token)
+            expect = "comma"
+            continue
+        out.append(char)
+        index += 1
+    if in_string:
+        out.append('"')
+    return "".join(out)
+
+
+def _escape_string_controls(text: str) -> str:
+    """Turn raw line breaks inside JSON strings into escaped characters."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+                out.append(char)
+                continue
+            if char == "\\":
+                escape = True
+                out.append(char)
+                continue
+            if char == '"':
+                in_string = False
+                out.append(char)
+                continue
+            if char == "\n":
+                out.append("\\n")
+                continue
+            if char == "\r":
+                out.append("\\r")
+                continue
+            if char == "\t":
+                out.append("\\t")
+                continue
+        elif char == '"':
+            in_string = True
+        out.append(char)
+    return "".join(out)
+
+
+def _insert_missing_commas(text: str) -> str:
+    """Insert a comma when a JSON value is followed by another value."""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    expect = "value"
+
+    def value_start(char: str) -> bool:
+        return char in '{["' or char.isdigit() or char in "-tfn"
+
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+                expect = "comma"
+            index += 1
+            continue
+        if char.isspace():
+            out.append(char)
+            index += 1
+            continue
+        if expect == "comma" and char not in ",}]" and value_start(char):
+            out.append(",")
+            expect = "key" if stack and stack[-1] == "{" else "value"
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char in "{[":
+            stack.append(char)
+            expect = "key" if char == "{" else "value"
+            out.append(char)
+            index += 1
+            continue
+        if char in "}]":
+            if stack:
+                stack.pop()
+            expect = "comma"
+            out.append(char)
+            index += 1
+            continue
+        if char == ":":
+            expect = "value"
+            out.append(char)
+            index += 1
+            continue
+        if char == ",":
+            expect = "key" if stack and stack[-1] == "{" else "value"
+            out.append(char)
+            index += 1
+            continue
+        if char == "-" or char.isdigit() or text.startswith(("true", "false", "null"), index):
+            if text.startswith("true", index):
+                token = "true"
+            elif text.startswith("false", index):
+                token = "false"
+            elif text.startswith("null", index):
+                token = "null"
+            else:
+                end = index + 1
+                while end < length and text[end] in "0123456789.eE+-":
+                    end += 1
+                token = text[index:end]
+            out.append(token)
+            index += len(token)
+            expect = "comma"
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _fix_bracket_mismatch(text: str) -> str:
+    """Use the bracket that matches the open container when the model swaps ] and }."""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char in "{[":
+            stack.append(char)
+            out.append(char)
+            index += 1
+            continue
+        if char == "}" and stack and stack[-1] == "[":
+            stack.pop()
+            out.append("]")
+            index += 1
+            continue
+        if char == "]" and stack and stack[-1] == "{":
+            stack.pop()
+            out.append("}")
+            index += 1
+            continue
+        if char in "}]":
+            if stack:
+                stack.pop()
+            out.append(char)
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _json_object(content: str) -> dict:
     text = _strip_fence(content)
     start = text.find("{")
     if start < 0:
         raise ValueError("planner output did not match the test plan schema")
     blob = text[start:]
-    try:
-        value, _ = json.JSONDecoder().raw_decode(blob)
-    except json.JSONDecodeError:
-        value, _ = json.JSONDecoder().raw_decode(_repair_json(blob))
-    if not isinstance(value, dict):
-        raise TypeError("planner output did not match the test plan schema")
-    return value
+    escaped = _escape_string_controls(blob)
+    quoted = _escape_interior_quotes(blob)
+    quoted_escaped = _escape_interior_quotes(escaped)
+    bracketed = _fix_bracket_mismatch(blob)
+    candidates = (
+        blob,
+        escaped,
+        bracketed,
+        _insert_missing_commas(blob),
+        _insert_missing_commas(escaped),
+        _insert_missing_commas(bracketed),
+        quoted,
+        quoted_escaped,
+        _insert_missing_commas(quoted),
+        _insert_missing_commas(quoted_escaped),
+        _fix_bracket_mismatch(quoted),
+        _fix_bracket_mismatch(quoted_escaped),
+        _insert_missing_commas(_fix_bracket_mismatch(quoted)),
+        _insert_missing_commas(_fix_bracket_mismatch(quoted_escaped)),
+        _repair_json(blob),
+        _insert_missing_commas(_repair_json(escaped)),
+    )
+    last_error = "no JSON object found"
+    for candidate in candidates:
+        try:
+            value, _ = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = f"{exc.msg} (line {exc.lineno} column {exc.colno})"
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError(last_error)
 
 
 def _parse_operations(content: str) -> dict[int, list]:
@@ -1205,7 +1625,7 @@ def _parse_plan(content: str) -> PlanResult:
     raw_phases = payload.get("phases")
     if isinstance(raw_phases, list):
         logger.info(f"Processing {len(raw_phases)} phases")
-        phases, problem = _coerce_phases(raw_phases)
+        phases, problem = _coerce_phases(_integer_phases(raw_phases))
         if problem:
             return PlanResult(accepted=False, reason=problem, reason_code="not_a_test_plan")
         accepted = payload.get("accepted")
@@ -1245,6 +1665,7 @@ def _parse_plan(content: str) -> PlanResult:
         return _reject(f"planner output did not match the test plan schema: {error_detail}")
 
 
+
 class ChatModelPlanner:
     """Plans and writes scripts through the configured chat model."""
 
@@ -1282,15 +1703,12 @@ class ChatModelPlanner:
         
         enhanced_specification = context + specification
         
+        messages = [
+            SystemMessage(content=_PLAN_SYSTEM),
+            HumanMessage(content=enhanced_specification),
+        ]
         try:
-            message = self.model.invoke(
-                [
-                    SystemMessage(content=_PLAN_SYSTEM),
-                    HumanMessage(content=enhanced_specification),
-                ]
-            )
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            result = _parse_plan(content)
+            result, content = invoke_json(self.model, messages, _parse_plan)
         except Exception as exc:  # noqa: BLE001 - unparseable model output is a rejection
             import traceback
             detail = str(exc).splitlines()[0]
@@ -1305,13 +1723,27 @@ class ChatModelPlanner:
                     content,
                     (result.reason or "The draft rejected the request.")
                     + " You are the planner, not the executor. Write the phases instead. "
-                    "A page check stays on the GUI phase that opens the page, "
+                    + _SERVICE_PIPELINE
+                    + "A page check stays on the GUI phase that opens the page, "
                     "types into the named field, and clicks the named button. "
                     "Do not reject that sequence.",
                 )
             except Exception as exc:  # noqa: BLE001 - a bad revision is a rejection
                 detail = str(exc).splitlines()[0]
                 return _reject(self._detail_rejection(specification, result.reason or detail))
+            if not result.accepted and _refused_to_plan(result.reason):
+                try:
+                    result = self._repair_plan(
+                        enhanced_specification,
+                        content,
+                        (result.reason or "The draft rejected the request.")
+                        + " "
+                        + _SERVICE_PIPELINE
+                        + "Set accepted to true and return those phases.",
+                    )
+                except Exception as exc:  # noqa: BLE001 - a bad revision is a rejection
+                    detail = str(exc).splitlines()[0]
+                    return _reject(self._detail_rejection(specification, result.reason or detail))
         if not result.accepted:
             return _reject(self._detail_rejection(specification, result.reason))
         if result.phases:
@@ -1353,20 +1785,18 @@ class ChatModelPlanner:
         return PlanResult(accepted=True, steps=steps, phases=ordered, reason=result.reason)
 
     def _repair_plan(self, specification: str, draft: str, finding: str) -> PlanResult:
-        message = self.model.invoke(
-            [
-                SystemMessage(content=_REPAIR_SYSTEM),
-                HumanMessage(
-                    content=(
-                        f"Testing request:\n{specification}\n\n"
-                        f"Draft plan:\n{draft}\n\n"
-                        f"What is wrong:\n{finding}"
-                    )
-                ),
-            ]
-        )
-        revised = message.content if isinstance(message.content, str) else str(message.content)
-        return _parse_plan(revised)
+        messages = [
+            SystemMessage(content=_REPAIR_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Testing request:\n{specification}\n\n"
+                    f"Draft plan:\n{draft}\n\n"
+                    f"What is wrong:\n{finding}"
+                )
+            ),
+        ]
+        revised, _content = invoke_json(self.model, messages, _parse_plan)
+        return revised
 
     def _detail_rejection(self, specification: str, finding: str | None) -> str:
         text = (finding or "").strip() or "The request could not be turned into a linear testing plan."
@@ -1400,14 +1830,11 @@ class ChatModelPlanner:
                     lines.append("Operations: " + "; ".join(step.operation_notes))
                 if step.verifications:
                     lines.append("Verifications: " + "; ".join(step.verifications))
-        message = self.model.invoke(
-            [
-                SystemMessage(content=_OPS_SYSTEM),
-                HumanMessage(content="\n".join(lines)),
-            ]
-        )
-        content = message.content if isinstance(message.content, str) else str(message.content)
-        by_step = _parse_operations(content)
+        messages = [
+            SystemMessage(content=_OPS_SYSTEM),
+            HumanMessage(content="\n".join(lines)),
+        ]
+        by_step, _content = invoke_json(self.model, messages, _parse_operations)
         filled: list[TestStep] = []
         for step in steps:
             operations = by_step.get(step.step)
@@ -1443,36 +1870,34 @@ class ChatModelPlanner:
         try:
             import json
             step_text = json.dumps(step, indent=2, default=str)
-            message = self.model.invoke(
-                [
-                    SystemMessage(content=_FIX_STEP_SYSTEM),
-                    HumanMessage(
-                        content=f"Failed step (attempt {retry_count + 1}):\n{step_text}\n\n"
-                        f"Error:\n{error}\n\n"
-                        f"Determine if this should be retried and provide a corrected version if so."
-                    ),
-                ]
-            )
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            content = _strip_fence(content)
-            response = json.loads(content)
-
-            # Check if LLM says this should not be retried
-            if response.get("should_retry") is False:
-                # Return the original step with a flag to indicate no retry
+            messages = [
+                SystemMessage(content=_FIX_STEP_SYSTEM),
+                HumanMessage(
+                    content=f"Failed step (attempt {retry_count + 1}):\n{step_text}\n\n"
+                    f"Error:\n{error}\n\n"
+                    f"Determine if this should be retried and provide a corrected version if so."
+                ),
+            ]
+            response, _content = invoke_json(self.model, messages, _json_object)
+            retry = response.get("should_retry")
+            approved = retry is True or (isinstance(retry, str) and retry.strip().lower() == "true")
+            if not approved:
                 step["_should_not_retry"] = True
-                step["_retry_judgment"] = response.get("judgment", "Hard failure detected by LLM")
+                step["_retry_judgment"] = response.get("judgment") or "The model classified this as a hard failure."
                 return step
-            
-            # Get the fixed step from the response
-            fixed_step = response.get("step", step)
-            # Ensure the step number and interface are preserved
+            proposed = response.get("step") if isinstance(response.get("step"), dict) else {}
+            fixed_step = dict(step)
+            fixed_step.update({key: value for key, value in proposed.items() if value is not None})
+            fixed_step.pop("_should_not_retry", None)
+            fixed_step.pop("_retry_judgment", None)
             fixed_step["step"] = step.get("step")
             fixed_step["interface"] = step.get("interface")
             return fixed_step
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Failed to fix step: {exc}")
-            return step  # Return original step if fixing fails
+            step["_should_not_retry"] = True
+            step["_retry_judgment"] = "The model did not return a usable step update."
+            return step
 
     def update_coding_context(self, coding_instructions: list[dict]) -> None:
         """Update the planner's context with coding instructions from previous steps."""
@@ -1481,8 +1906,6 @@ class ChatModelPlanner:
     def refine_plan(self, current_phases: list[TestPhase], current_steps: list[TestStep],
                    user_feedback: str, chat_history: list[dict]) -> tuple[list[TestPhase], list[TestStep], str]:
         """Refine the plan based on user feedback. Returns (phases, steps, reasoning)."""
-        import json
-        
         # Build chat history context
         history_context = ""
         if chat_history:
@@ -1492,29 +1915,19 @@ class ChatModelPlanner:
                 content = msg.get("content", "")
                 history_context += f"{role}: {content}\n"
         
-        # Build current plan context
-        plan_context = "\n\nCurrent plan:\n"
-        for phase in current_phases:
-            plan_context += f"Phase {phase.phase}: {phase.name} ({phase.interface})\n"
-            plan_context += f"  Depends on: {phase.depends_on}\n"
-            plan_context += f"  Verifications: {phase.verifications}\n"
-        for step in current_steps:
-            plan_context += f"Step {step.step}: {step.action} ({step.interface})\n"
-            plan_context += f"  Assertion: {step.assertion}\n"
-            plan_context += f"  Verifications: {step.verifications}\n"
-        
+        plan_json = json.dumps([phase.model_dump() for phase in current_phases], indent=2)
+        messages = [
+            SystemMessage(content=_REFINE_PLAN_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"User feedback: {user_feedback}\n\n"
+                    f"Current phases JSON:\n{plan_json}\n\n"
+                    f"{history_context}"
+                )
+            ),
+        ]
         try:
-            message = self.model.invoke(
-                [
-                    SystemMessage(content=_REFINE_PLAN_SYSTEM),
-                    HumanMessage(
-                        content=f"User feedback: {user_feedback}\n\n{plan_context}\n\n{history_context}"
-                    ),
-                ]
-            )
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            content = _strip_fence(content)
-            response = json.loads(content)
+            response, content = invoke_json(self.model, messages, _json_object)
             
             # Check if this is an answer or a plan update
             if response.get("type") == "answer":
@@ -1527,21 +1940,18 @@ class ChatModelPlanner:
                     user_feedback,
                 )
                 if problem:
-                    repaired = self.model.invoke(
-                        [
-                            SystemMessage(content=_REPAIR_SYSTEM),
-                            HumanMessage(
-                                content=(
-                                    f"User feedback: {user_feedback}\n\n"
-                                    f"Current phases must all remain unless the user asked to remove one.\n"
-                                    f"Draft phases:\n{content}\n\n"
-                                    f"What is wrong:\n{problem}"
-                                )
-                            ),
-                        ]
-                    )
-                    repaired_text = repaired.content if isinstance(repaired.content, str) else str(repaired.content)
-                    revised = _json_object(_strip_fence(repaired_text))
+                    repair_messages = [
+                        SystemMessage(content=_REPAIR_SYSTEM),
+                        HumanMessage(
+                            content=(
+                                f"User feedback: {user_feedback}\n\n"
+                                f"Current phases must all remain unless the user asked to remove one.\n"
+                                f"Draft phases:\n{content}\n\n"
+                                f"What is wrong:\n{problem}"
+                            )
+                        ),
+                    ]
+                    revised, _repaired_text = invoke_json(self.model, repair_messages, _json_object)
                     phases, steps, problem = _apply_phase_update(
                         current_phases,
                         revised.get("phases") or [],
@@ -1573,30 +1983,61 @@ def _command_line(line: str) -> str:
     return text.strip()
 
 
+def _looks_like_command(text: str) -> bool:
+    """A shell command starts with a program name, not a prose label."""
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    token = argv[0]
+    if token == "source":
+        return True
+    if not re.fullmatch(r"[A-Za-z0-9_./+-]+", token):
+        return False
+    if any(char.isupper() for char in token) and "/" not in token:
+        return False
+    lowered = f" {text.lower()} "
+    if " the " in lowered and PurePath(token).name.lower() not in _NETWORK_COMMANDS:
+        return False
+    return True
+
+
+def _command_from_line(line: str) -> str | None:
+    text = re.sub(r"^\d+[\).]\s*", "", line.strip())
+    text = _command_line(text)
+    if not text:
+        return None
+    if _looks_like_command(text):
+        return text
+    for match in re.finditer(r":\s*(\S.*?)\s*$", text):
+        tail = match.group(1).strip().rstrip(".!?")
+        if _looks_like_command(tail):
+            return tail
+    return None
+
+
 def command_from_intent(intent: str) -> str | None:
     """Return a shell command when the operation is one, rather than a prose step."""
     action = intent.split("\nAssertion:", 1)[0].strip()
     if action.lower().startswith("carry out:"):
         action = action.split(":", 1)[1].strip()
-    raw = action.splitlines()[0].strip() if action else ""
-    line = _command_line(raw)
-    if not line:
+    pieces: list[str] = []
+    for line in action.splitlines():
+        pieces.extend(part.strip() for part in re.split(r"(?<=\.)\s+(?=[A-Z])", line) if part.strip())
+    commands: list[str] = []
+    for piece in pieces:
+        command = _command_from_line(piece)
+        if command and command not in commands:
+            commands.append(command)
+    if not commands:
         return None
-    try:
-        argv = shlex.split(line)
-    except ValueError:
-        return None
-    if not argv:
-        return None
-    name = PurePath(argv[0]).name
-    if not re.fullmatch(r"[A-Za-z0-9_./+-]+", argv[0]):
-        return None
-    if line.endswith((".", "?", "!")):
-        return None
-    lowered = f" {line.lower()} "
-    if " the " in lowered and name.lower() not in _NETWORK_COMMANDS:
-        return None
-    return line
+    if len(commands) == 1:
+        return commands[0]
+    if any(command.rstrip().endswith("&") for command in commands):
+        return "\n".join(commands)
+    return " && ".join(commands)
 
 
 def command_needs_network(command: str) -> bool:
@@ -1604,17 +2045,24 @@ def command_needs_network(command: str) -> bool:
         argv = shlex.split(command)
     except ValueError:
         return False
-    if not argv:
-        return False
-    return PurePath(argv[0]).name.lower() in _NETWORK_COMMANDS
+    names = {PurePath(token).name.lower() for token in argv}
+    return bool(names & {name.lower() for name in _NETWORK_COMMANDS})
+
+
+def _needs_shell(command: str) -> bool:
+    return bool(re.search(r"&&|\|\||[;|&<>]|`|\$\(|\bsource\b|\n", command))
 
 
 def command_script(command: str) -> str:
     """Run the planned command and print its stdout."""
-    argv = shlex.split(command)
+    if _needs_shell(command):
+        launched = f"subprocess.run({command!r}, shell=True, executable='/bin/bash', capture_output=True, text=True, timeout=120)"
+    else:
+        argv = shlex.split(command)
+        launched = f"subprocess.run({argv!r}, capture_output=True, text=True, timeout=20)"
     return (
         "import subprocess\n"
-        f"completed = subprocess.run({argv!r}, capture_output=True, text=True, timeout=20)\n"
+        f"completed = {launched}\n"
         "print(completed.stdout, end='')\n"
         "if completed.returncode:\n"
         "    raise SystemExit(completed.stderr or f'exit {completed.returncode}')\n"

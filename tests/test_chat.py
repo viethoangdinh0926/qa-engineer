@@ -232,6 +232,15 @@ def test_verbose_verification_keeps_the_original_sentence() -> None:
     ) == 'The result contains the text "registered". No other substitution satisfies this check.'
 
 
+def test_cli_verifications_must_name_the_command_streams() -> None:
+    from aqe.llm import _PLAN_SYSTEM, _REFINE_PLAN_SYSTEM, _REPAIR_SYSTEM
+
+    for prompt in (_PLAN_SYSTEM, _REFINE_PLAN_SYSTEM, _REPAIR_SYSTEM):
+        assert "$? " in prompt
+        assert "vague" in prompt
+        assert "background service is running" in prompt
+
+
 def test_stdout_claim_is_removed_when_the_request_does_not_mention_output() -> None:
     from aqe.llm import omit_unrequested_stdout
     from aqe.state import TestPhase
@@ -331,6 +340,26 @@ def test_curl_command_is_the_script() -> None:
     assert "google.com" in script
     assert command_needs_network("curl google.com") is True
     assert command_needs_network("echo hello") is False
+
+
+def test_labeled_notes_run_the_shell_commands() -> None:
+    from aqe.llm import ChatModelPlanner
+
+    class Reply:
+        def invoke(self, messages: list):
+            del messages
+            raise AssertionError("labeled shell notes do not ask the model for a script")
+
+    notes = (
+        "Create and activate virtual environment: python -m venv venv && source venv/bin/activate. "
+        "Install dependencies: pip install -r requirements.txt\n"
+        "Assertion: Dependencies are installed successfully within the virtual environment."
+    )
+    script = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").script_for(notes)
+    assert "shell=True" in script
+    assert "python -m venv venv && source venv/bin/activate && pip install -r requirements.txt" in script
+    assert "Create" not in script
+    assert "Install" not in script
 
 
 def test_json_assertion_reads_evidence_file() -> None:
@@ -630,6 +659,77 @@ def test_structural_rejection_is_replanned() -> None:
     assert result.steps[0].operations[2].selector["name"] == "Commit"
 
 
+def test_running_api_refusal_is_replanned() -> None:
+    import json
+
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+
+    reason = (
+        "The request requires creating and verifying a running API service. "
+        "While I can use the Pi coding agent to generate the source code files, "
+        "I do not have the capability to execute this code to start a server or "
+        "interact with a live network endpoint to perform the health check verification. "
+        "Therefore, the verification phase cannot be executed using the available tools."
+    )
+    plan = {
+        "accepted": True,
+        "reason": None,
+        "phases": [
+            {
+                "phase": 1,
+                "name": "Write the API",
+                "depends_on": [],
+                "interface": "CODING",
+                "coding_operations": [
+                    {
+                        "action": "create_file",
+                        "file_path": "app.py",
+                        "content": "print('ok')\n",
+                        "description": "API service",
+                    }
+                ],
+                "verifications": ["The file app.py contains the API service."],
+            },
+            {
+                "phase": 2,
+                "name": "Check the health endpoint",
+                "depends_on": [1],
+                "interface": "CLI",
+                "operations": [
+                    "nohup python app.py > service.log 2>&1 &",
+                    "curl http://127.0.0.1:8080/health",
+                ],
+                "verifications": ["The health endpoint returns a successful response."],
+            },
+        ],
+    }
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content=json.dumps({"accepted": False, "reason": reason, "phases": []}))
+            assert "CODING phase" in messages[-1].content
+            assert "health check" in messages[-1].content
+            if self.calls == 2:
+                return AIMessage(content=json.dumps({"accepted": False, "reason": reason, "phases": []}))
+            assert "Set accepted to true" in messages[-1].content
+            return AIMessage(content=json.dumps(plan))
+
+    result = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").plan(
+        "Create an API service and verify that its health endpoint is running."
+    )
+    assert result.accepted
+    assert [step.interface for step in result.steps] == ["CODING", "CLI"]
+    assert result.steps[1].depends_on == [1]
+    assert "curl http://127.0.0.1:8080/health" in result.steps[1].operation_notes
+
+
 def test_short_rejection_is_expanded() -> None:
     from langchain_core.messages import AIMessage
 
@@ -670,3 +770,735 @@ def test_unparsed_planner_output_is_rejected() -> None:
     result = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").plan(SAMPLE)
     assert result.accepted is False
     assert result.reason_code == "not_a_test_plan"
+
+
+def test_plan_chat_reads_json_with_a_missing_comma_and_a_raw_newline() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import CodingAction, TestPhase, TestStep
+
+    broken = """{
+      "type": "plan_update",
+      "phases": [
+        {
+          "phase": 1,
+          "name": "Write the API",
+          "interface": "CODING",
+          "coding_operations": [
+            {
+              "action": "create_file",
+              "file_path": "app.py",
+              "content": "from flask import Flask
+app = Flask(__name__)",
+              "description": "Create the API"
+            }
+          ],
+          "verifications": ["The file app.py contains Flask."]
+        }
+        {
+          "phase": 2,
+          "name": "Check health",
+          "depends_on": [1],
+          "interface": "CLI",
+          "operations": ["curl http://127.0.0.1:8080/health"],
+          "verifications": ["The health endpoint returns OK."]
+        }
+      ],
+      "reasoning": "Updated the service file."
+    }"""
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            del messages
+            return AIMessage(content=broken)
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Write the API",
+            interface="CODING",
+            coding_operations=[
+                CodingAction(action="create_file", file_path="app.py", content="print('ok')\n", description="API")
+            ],
+            verifications=["The file app.py contains Flask."],
+        )
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create app.py",
+            assertion="The file app.py contains Flask.",
+            verifications=["The file app.py contains Flask."],
+            coding_operations=current[0].coding_operations,
+        )
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Put Flask in app.py", []
+    )
+    assert "Failed to refine" not in reasoning
+    assert [phase.phase for phase in phases] == [1, 2]
+    assert "from flask import Flask\napp = Flask(__name__)" == phases[0].coding_operations[0].content
+    assert phases[1].interface == "CLI"
+
+
+def test_plan_chat_reads_source_that_contains_quotes() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import CodingAction, TestPhase, TestStep
+
+    source = """from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/health")
+def health_check():
+    return {"status": "ok"}
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+"""
+    broken = (
+        "{\n"
+        '  "type": "plan_update",\n'
+        '  "phases": [\n'
+        "    {\n"
+        '      "phase": 1,\n'
+        '      "name": "Create API Service",\n'
+        '      "interface": "CODING",\n'
+        '      "coding_operations": [{\n'
+        '        "action": "create_file",\n'
+        '        "file_path": "app.py",\n'
+        '        "content": "' + source + '",\n'
+        '        "description": "Generate the Flask application."\n'
+        "      }],\n"
+        '      "verifications": ["The file app.py contains a /health endpoint."]\n'
+        "    }\n"
+        "    {\n"
+        '      "phase": 2,\n'
+        '      "name": "Install dependencies",\n'
+        '      "interface": "CLI",\n'
+        '      "operations": ["pip install flask"],\n'
+        '      "verifications": ["Flask is installed."]\n'
+        "    }\n"
+        "  ],\n"
+        '  "reasoning": "Install dependencies before the health check."\n'
+        "}\n"
+    )
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            del messages
+            return AIMessage(content=broken)
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Create API Service",
+            interface="CODING",
+            coding_operations=[
+                CodingAction(
+                    action="create_file",
+                    file_path="app.py",
+                    content="print('ok')\n",
+                    description="API",
+                )
+            ],
+            verifications=["The file app.py contains a /health endpoint."],
+        )
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create API Service",
+            assertion="The file app.py contains a /health endpoint.",
+            verifications=["The file app.py contains a /health endpoint."],
+            coding_operations=current[0].coding_operations,
+        )
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Before phase 2, you should install dependencies for the API app.", []
+    )
+    assert "Failed to refine" not in reasoning
+    assert [phase.name for phase in phases] == ["Create API Service", "Install dependencies"]
+    assert '@app.route("/health")' in phases[0].coding_operations[0].content
+    assert '{"status": "ok"}' in phases[0].coding_operations[0].content
+    assert phases[1].operation_notes == ["pip install flask"]
+
+
+def test_plan_update_accepts_a_list_closed_with_a_brace() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import CodingAction, TestPhase, TestStep
+
+    broken = """{
+      "type": "plan_update",
+      "phases": [
+        {
+          "phase": 1,
+          "name": "Create API Service",
+          "interface": "CODING",
+          "depends_on": [],
+          "operations": [
+            {
+              "action": "create_file",
+              "file_path": "app.py",
+              "content": "print('ok')\\n",
+              "description": "Create the Flask application file app.py with a /health endpoint."
+            }
+          ],
+          "verifications": ["The file app.py contains a /health endpoint."]
+        },
+        {
+          "phase": 2,
+          "name": "Install Dependencies",
+          "interface": "CLI",
+          "depends_on": [1],
+          "operations": ["pip install -r requirements.txt"],
+          "verifications": ["Dependencies for the API application have been installed successfully."]
+        }
+      ],
+      "steps": [
+        {
+          "step": 2,
+          "interface": "CLI",
+          "action": "Install Dependencies",
+          "assertion": "Dependencies are installed.",
+          "verifications": ["Dependencies for the API application have been installed successfully."],
+          "operations": ["pip install -r requirements.txt"]
+        }
+      },
+      "reasoning": "Added Phase 2 to install dependencies before starting the service."
+    }"""
+    lines = broken.splitlines()
+    for index, line in enumerate(lines):
+        if '"reasoning"' in line:
+            lines[index - 1] = "      },"
+            break
+    broken = "\n".join(lines)
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            del messages
+            return AIMessage(content=broken)
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Create API Service",
+            interface="CODING",
+            coding_operations=[
+                CodingAction(action="create_file", file_path="app.py", content="print('ok')\n", description="API")
+            ],
+            verifications=["The file app.py contains a /health endpoint."],
+        ),
+        TestPhase(
+            phase=2,
+            name="Start API Service",
+            interface="CLI",
+            depends_on=[1],
+            operation_notes=["python app.py &"],
+            verifications=["A python process running app.py is present."],
+        ),
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create API Service",
+            assertion="The file app.py contains a /health endpoint.",
+            verifications=["The file app.py contains a /health endpoint."],
+            coding_operations=current[0].coding_operations,
+        ),
+        TestStep(
+            step=2,
+            interface="CLI",
+            action="python app.py &",
+            assertion="A python process running app.py is present.",
+            verifications=["A python process running app.py is present."],
+            operation_notes=["python app.py &"],
+        ),
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Before phase 2, you should install dependencies for the API app.", []
+    )
+    assert "Failed to refine" not in reasoning
+    assert [phase.name for phase in phases] == ["Create API Service", "Install Dependencies"]
+    assert phases[1].operation_notes == ["pip install -r requirements.txt"]
+    assert phases[0].coding_operations[0].file_path == "app.py"
+
+
+def test_json_plan_update_inserts_a_phase() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import CodingAction, TestPhase, TestStep
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            assert "one valid JSON object" in messages[0].content
+            assert "Do not return JSON" not in messages[0].content
+            return AIMessage(
+                content=(
+                    '{"type": "plan_update", "reasoning": "Added an install phase.", "phases": ['
+                    '{"phase": 1, "name": "Create API Service", "interface": "CODING", '
+                    '"coding_operations": [{"action": "create_file", "file_path": "app.py", '
+                    '"content": "from flask import Flask\\n", "description": "Flask application"}], '
+                    '"verifications": ["The file app.py contains a /health endpoint."]}, '
+                    '{"phase": 2, "name": "Install dependencies", "interface": "CLI", "depends_on": [1], '
+                    '"operation_notes": ["pip install flask"], "verifications": ["Flask is installed."]}, '
+                    '{"phase": 3, "name": "Start API Service", "interface": "CLI", "depends_on": [2], '
+                    '"operation_notes": ["python app.py &"], '
+                    '"verifications": ["A python process running app.py is present."]}]}'
+                )
+            )
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Create API Service",
+            interface="CODING",
+            coding_operations=[
+                CodingAction(
+                    action="create_file",
+                    file_path="app.py",
+                    content="from flask import Flask\n",
+                    description="Flask application",
+                )
+            ],
+            verifications=["The file app.py contains a /health endpoint."],
+        ),
+        TestPhase(
+            phase=2,
+            name="Start API Service",
+            interface="CLI",
+            depends_on=[1],
+            operation_notes=["python app.py &"],
+            verifications=["A python process running app.py is present."],
+        ),
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create API Service",
+            assertion="The file app.py contains a /health endpoint.",
+            verifications=["The file app.py contains a /health endpoint."],
+            coding_operations=current[0].coding_operations,
+        ),
+        TestStep(
+            step=2,
+            interface="CLI",
+            action="python app.py &",
+            assertion="A python process running app.py is present.",
+            verifications=["A python process running app.py is present."],
+            operation_notes=["python app.py &"],
+        ),
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Before phase 2, you should install dependencies for the API app.", []
+    )
+    assert "Failed to refine" not in reasoning
+    assert [phase.name for phase in phases] == [
+        "Create API Service",
+        "Install dependencies",
+        "Start API Service",
+    ]
+    assert phases[1].interface == "CLI"
+    assert phases[1].operation_notes == ["pip install flask"]
+    assert phases[0].coding_operations[0].content.startswith("from flask import Flask")
+    assert phases[2].operation_notes == ["python app.py &"]
+
+
+def test_json_plan_update_is_applied_directly() -> None:
+    import json
+
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import CodingAction, TestPhase, TestStep
+
+    flask = "from flask import Flask\napp = Flask(__name__)\n"
+    payload = {
+        "type": "plan_update",
+        "reasoning": "Create the virtual environment before installing Flask.",
+        "phases": [
+            {
+                "phase": 1,
+                "name": "Create API service code",
+                "interface": "CODING",
+                "coding_operations": [
+                    {
+                        "action": "create_file",
+                        "file_path": "app.py",
+                        "content": flask,
+                        "description": "Flask application",
+                    }
+                ],
+                "verifications": ["The file app.py contains a /health endpoint."],
+            },
+            {
+                "phase": 2,
+                "name": "Create virtual environment",
+                "interface": "CLI",
+                "depends_on": [1],
+                "operation_notes": ["python3 -m venv venv"],
+                "verifications": ["The virtual environment is created."],
+            },
+            {
+                "phase": 3,
+                "name": "Install dependencies",
+                "interface": "CLI",
+                "depends_on": [2],
+                "operation_notes": ["venv/bin/pip install flask"],
+                "verifications": ["Flask is installed in the virtual environment."],
+            },
+            {
+                "phase": 4,
+                "name": "Start API service",
+                "interface": "CLI",
+                "depends_on": [3],
+                "operation_notes": ["venv/bin/python app.py &"],
+                "verifications": ["A python process running app.py is present."],
+            },
+            {
+                "phase": 5,
+                "name": "Verify health check endpoint",
+                "interface": "CLI",
+                "depends_on": [4],
+                "operation_notes": ["curl http://localhost:8080/health"],
+                "verifications": ["The curl command returned a response."],
+            },
+        ],
+    }
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payload))
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Create API service code",
+            interface="CODING",
+            coding_operations=[
+                CodingAction(action="create_file", file_path="app.py", content=flask, description="Flask application")
+            ],
+            verifications=["The file app.py contains a /health endpoint."],
+        ),
+        TestPhase(
+            phase=2,
+            name="Install dependencies",
+            interface="CLI",
+            depends_on=[1],
+            operation_notes=["pip install flask"],
+            verifications=["Flask is installed."],
+        ),
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create API service code",
+            assertion="The file app.py contains a /health endpoint.",
+            verifications=["The file app.py contains a /health endpoint."],
+            coding_operations=current[0].coding_operations,
+        )
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current,
+        steps,
+        "Update phase 2 to create and activate a virtual environment before install dependencies.",
+        [],
+    )
+    assert reasoning == payload["reasoning"]
+    assert [phase.operation_notes for phase in phases] == [
+        [],
+        ["python3 -m venv venv"],
+        ["venv/bin/pip install flask"],
+        ["venv/bin/python app.py &"],
+        ["curl http://localhost:8080/health"],
+    ]
+    assert phases[0].coding_operations[0].content == flask
+    assert [phase.depends_on for phase in phases] == [[], [1], [2], [3], [4]]
+
+
+def test_prose_plan_reply_is_sent_back_for_valid_json() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import TestPhase, TestStep
+
+    valid = (
+        '{"type": "plan_update", "reasoning": "Install inside a virtual environment.", "phases": ['
+        '{"phase": 1, "name": "Install dependencies", "interface": "CLI", "depends_on": [], '
+        '"operation_notes": ["python3 -m venv venv && venv/bin/pip install flask"], '
+        '"verifications": ["Flask is installed in the virtual environment."]}]}'
+    )
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.queries: list[str] = []
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            self.queries.append(messages[-1].content)
+            return AIMessage(content="Phase 2 will be a command line phase running python3 -m venv venv.")
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Install dependencies",
+            interface="CLI",
+            operation_notes=["pip install flask"],
+            verifications=["Flask is installed."],
+        )
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CLI",
+            action="pip install flask",
+            assertion="Flask is installed.",
+            verifications=["Flask is installed."],
+            operation_notes=["pip install flask"],
+        )
+    ]
+    model = Reply()
+    phases, _, reasoning = ChatModelPlanner(model, "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Use a virtual environment.", []
+    )
+    assert model.calls == 1
+    assert "not valid JSON" not in model.queries[0]
+    assert phases == current
+    assert reasoning.startswith("Failed to refine plan:")
+
+
+def test_unparsed_json_is_requested_three_times() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import TestPhase, TestStep
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.queries: list[str] = []
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            self.queries.append(messages[-1].content)
+            return AIMessage(content="Create a virtual environment before installing.")
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Install dependencies",
+            interface="CLI",
+            operation_notes=["pip install flask"],
+            verifications=["Flask is installed."],
+        )
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CLI",
+            action="pip install flask",
+            assertion="Flask is installed.",
+            verifications=["Flask is installed."],
+            operation_notes=["pip install flask"],
+        )
+    ]
+    model = Reply()
+    phases, _, reasoning = ChatModelPlanner(model, "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Use a virtual environment.", []
+    )
+    assert model.calls == 1
+    assert phases == current
+    assert reasoning.startswith("Failed to refine plan:")
+
+
+def test_decimal_phase_number_is_inserted_in_order() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import TestPhase, TestStep
+
+    reply = """
+    {"type": "plan_update", "reasoning": "Inserted the install phase.", "phases": [
+      {"phase": 1, "name": "Create API service code", "interface": "CODING",
+       "coding_operations": [{"action": "create_file", "file_path": "app.py", "content": "from flask import Flask\\n", "description": "API"}],
+       "verifications": ["The file app.py contains Flask."]},
+      {"phase": 1.5, "name": "Install dependencies", "interface": "CLI", "depends_on": [1],
+       "operation_notes": ["pip install flask"], "verifications": ["Flask is installed."]},
+      {"phase": 2, "name": "Start API service", "interface": "CLI", "depends_on": [1.5],
+       "operation_notes": ["python app.py &"], "verifications": ["The API process is present."]}
+    ]}
+    """
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            del messages
+            return AIMessage(content=reply)
+
+    current = [
+        TestPhase(
+            phase=1,
+            name="Create API service code",
+            interface="CODING",
+            coding_operations=[],
+            verifications=["The file app.py contains Flask."],
+        ),
+        TestPhase(
+            phase=2,
+            name="Start API service",
+            interface="CLI",
+            depends_on=[1],
+            operation_notes=["python app.py &"],
+            verifications=["The API process is present."],
+        ),
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create API service code",
+            assertion="The file app.py contains Flask.",
+            verifications=["The file app.py contains Flask."],
+            coding_operations=[],
+        )
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current, steps, "Before phase 2, you should install dependencies for the API app.", []
+    )
+    assert reasoning == "Inserted the install phase."
+    assert [phase.name for phase in phases] == [
+        "Create API service code",
+        "Install dependencies",
+        "Start API service",
+    ]
+    assert phases[1].operation_notes == ["pip install flask"]
+    assert phases[2].depends_on == [2]
+
+
+def test_cli_phase_keeps_the_bash_script() -> None:
+    from aqe.llm import _coerce_phases, _phase_to_step
+
+    script = "set -e\npython3 -m venv venv\nsource venv/bin/activate\npip install -r requirements.txt\n"
+    phases, problem = _coerce_phases(
+        [
+            {
+                "phase": 1,
+                "name": "Install dependencies",
+                "interface": "CLI",
+                "script": script,
+                "verifications": ["Dependencies are installed in the virtual environment."],
+            }
+        ]
+    )
+    assert problem is None
+    assert phases[0].script == script
+    step = _phase_to_step(phases[0])
+    assert step.script == script
+    assert step.interface == "CLI"
+
+
+def test_script_with_raw_newlines_and_quotes_is_valid_json() -> None:
+    from aqe.llm import _json_object
+
+    broken = """
+    {"type": "plan_update", "reasoning": "Create the virtual environment first.", "phases": [
+      {"phase": 1, "name": "Create API", "interface": "CODING",
+       "coding_operations": [{"action": "create_file", "file_path": "app.py",
+         "content": "return {"status": "ok"}", "description": "API"}],
+       "verifications": ["The file app.py exists."]},
+      {"phase": 2, "name": "Create virtual environment", "interface": "CLI",
+       "script": "python -m venv venv
+source venv/bin/activate
+",
+       "verifications": ["The virtual environment is created."]}
+    ]}
+    """
+    payload = _json_object(broken)
+    script = payload["phases"][1]["script"]
+    assert "python -m venv venv" in script
+    assert "source venv/bin/activate" in script
+    assert payload["phases"][0]["coding_operations"][0]["content"] == 'return {"status": "ok"}'
+
+
+def test_a_plan_update_stores_the_model_file_content() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import CodingAction, TestPhase, TestStep
+
+    reply = (
+        '{"type": "plan_update", "reasoning": "Create the virtual environment before install.", "phases": ['
+        '{"phase": 1, "name": "Create API", "interface": "CODING", "depends_on": [], '
+        '"coding_operations": [{"action": "create_file", "file_path": "app.py", '
+        '"content": "from flask import Flask\\n", "description": "API"}], '
+        '"verifications": ["The file app.py exists."]}, '
+        '{"phase": 2, "name": "Create virtual environment", "interface": "CLI", "depends_on": [1], '
+        '"script": "python3 -m venv venv\\n", '
+        '"verifications": ["The virtual environment is created."]}, '
+        '{"phase": 3, "name": "Install dependencies", "interface": "CLI", "depends_on": [2], '
+        '"script": "source venv/bin/activate\\npip install -r requirements.txt\\n", '
+        '"verifications": ["Dependencies are installed."]}]}'
+    )
+
+    class Reply:
+        def invoke(self, messages: list) -> AIMessage:
+            assert "Current phases JSON" in messages[-1].content
+            return AIMessage(content=reply)
+
+    flask = CodingAction(
+        action="create_file",
+        file_path="app.py",
+        content="print('old')\n",
+        description="API",
+    )
+    current = [
+        TestPhase(
+            phase=1,
+            name="Create API",
+            interface="CODING",
+            coding_operations=[flask],
+            verifications=["The file app.py exists."],
+        ),
+        TestPhase(
+            phase=2,
+            name="Install dependencies",
+            interface="CLI",
+            depends_on=[1],
+            script="pip install -r requirements.txt\n",
+            verifications=["Dependencies are installed."],
+        ),
+    ]
+    steps = [
+        TestStep(
+            step=1,
+            interface="CODING",
+            action="Create API",
+            assertion="The file app.py exists.",
+            verifications=["The file app.py exists."],
+            coding_operations=[flask],
+        )
+    ]
+    phases, _, reasoning = ChatModelPlanner(Reply(), "http://127.0.0.1:8765").refine_plan(
+        current,
+        steps,
+        "before install dependencies for the app, you should create and activate a virtual environment.",
+        [],
+    )
+    assert reasoning == "Create the virtual environment before install."
+    assert phases[0].coding_operations[0].content == "from flask import Flask\n"
+    assert phases[1].name == "Create virtual environment"
+    assert "python3 -m venv venv" in phases[1].script
+    assert phases[2].name == "Install dependencies"
+
