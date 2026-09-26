@@ -6,7 +6,6 @@ from aqe.chat import get_chat_model
 from aqe.llm import NONSENSE_SPEC
 from aqe.settings import get_settings
 
-
 SAMPLE = """# User registration webhook
 
 Verify that registration through the GUI records a webhook.
@@ -276,8 +275,10 @@ def test_returns_nothing_stays_an_empty_output_check() -> None:
     )
     assert result.accepted
     assert result.steps[0].verifications == [
-        "The command returns nothing. stdout is empty. "
-        "A successful exit code does not satisfy this check."
+        (
+            "The command returns nothing. stdout is empty. "
+            "A successful exit code does not satisfy this check."
+        )
     ]
     assert result.steps[0].action == "ls"
 

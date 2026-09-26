@@ -6,6 +6,10 @@ const state = {
   notice: "",
   formError: "",
   sources: new Map(),
+  plannerChatOpen: false,
+  plannerChatMessages: [],
+  currentPlan: null,
+  currentRunId: null,
 };
 
 function statusClass(value) {
@@ -29,7 +33,7 @@ async function loadCapabilities() {
   const response = await fetch("/v1/capabilities");
   const data = await response.json();
   chips.replaceChildren();
-  for (const name of ["browser", "desktop", "sandbox", "coding"]) {
+  for (const name of ["browser", "desktop", "coding"]) {
     const chip = document.createElement("span");
     chip.className = data[name] ? "chip" : "chip off";
     const detail = data.detail && data.detail[name] ? ` — ${data.detail[name]}` : "";
@@ -40,6 +44,50 @@ async function loadCapabilities() {
 
 function renderShell() {
   app.replaceChildren();
+  
+  // Create main layout with sidebar
+  const mainLayout = document.createElement("div");
+  mainLayout.className = "main-layout";
+  
+  // Sidebar for planner chat
+  const sidebar = document.createElement("aside");
+  sidebar.className = "sidebar";
+  sidebar.id = "planner-sidebar";
+  
+  const sidebarHeader = document.createElement("div");
+  sidebarHeader.className = "sidebar-header";
+  const sidebarTitle = document.createElement("h3");
+  sidebarTitle.textContent = "Planner Chat";
+  const toggleButton = document.createElement("button");
+  toggleButton.className = "toggle-sidebar";
+  toggleButton.textContent = "×";
+  toggleButton.addEventListener("click", () => {
+    state.plannerChatOpen = false;
+    sidebar.classList.remove("open");
+  });
+  sidebarHeader.append(sidebarTitle, toggleButton);
+  
+  const chatContainer = document.createElement("div");
+  chatContainer.className = "chat-container";
+  chatContainer.id = "chat-messages";
+  
+  const chatInput = document.createElement("div");
+  chatInput.className = "chat-input";
+  const chatTextarea = document.createElement("textarea");
+  chatTextarea.id = "chat-message";
+  chatTextarea.placeholder = "Ask the planner to modify the plan...";
+  chatTextarea.rows = 3;
+  const sendButton = document.createElement("button");
+  sendButton.textContent = "Send";
+  sendButton.addEventListener("click", () => sendPlannerMessage());
+  chatInput.append(chatTextarea, sendButton);
+  
+  sidebar.append(sidebarHeader, chatContainer, chatInput);
+  
+  // Main content area
+  const mainContent = document.createElement("main");
+  mainContent.className = "main-content";
+  
   const form = document.createElement("form");
   form.className = "card";
   const heading = document.createElement("h2");
@@ -80,7 +128,20 @@ function renderShell() {
   const list = document.createElement("div");
   list.id = "testing-runs";
   section.append(runsHeading, list);
-  app.append(form, notice, section);
+  mainContent.append(form, notice, section);
+  
+  mainLayout.append(sidebar, mainContent);
+  app.append(mainLayout);
+  
+  // Add toggle button for sidebar
+  const sidebarToggle = document.createElement("button");
+  sidebarToggle.className = "sidebar-toggle";
+  sidebarToggle.textContent = "☰ Planner Chat";
+  sidebarToggle.addEventListener("click", () => {
+    state.plannerChatOpen = !state.plannerChatOpen;
+    sidebar.classList.toggle("open", state.plannerChatOpen);
+  });
+  app.prepend(sidebarToggle);
 }
 
 function paintChrome() {
@@ -285,6 +346,8 @@ function runPanel(run) {
     waiting.textContent = "Waiting for the first step.";
     panel.append(waiting);
   }
+  
+  
   return panel;
 }
 
@@ -315,6 +378,7 @@ function watchRun(id) {
   source.onmessage = (event) => {
     const snapshot = JSON.parse(event.data);
     upsertRun(snapshot);
+
     if (snapshot.ready) {
       finished = true;
       source.close();
@@ -338,7 +402,7 @@ async function submitSpecification(area, button) {
     const response = await fetch("/v1/runs", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ specification: area.value }),
+      body: JSON.stringify({ specification: area.value, wait_for_approval: true }),
     });
     const body = await response.json();
     if (!response.ok) {
@@ -349,12 +413,254 @@ async function submitSpecification(area, button) {
     area.value = "";
     state.notice = `Started run ${body.id}`;
     state.expandedId = body.id;
+    state.currentRunId = body.id;
     window.history.pushState({}, "", `/runs/${body.id}`);
     upsertRun(body);
     watchRun(body.id);
+    
+    // Load plan and chat history
+    loadPlan(body.id);
+    loadChatHistory(body.id);
+    
     paintChrome();
   } finally {
     button.disabled = false;
+  }
+}
+
+async function loadPlan(runId) {
+  try {
+    const response = await fetch(`/v1/runs/${runId}/plan`);
+    if (response.ok) {
+      state.currentPlan = await response.json();
+      renderPlan();
+    }
+  } catch (error) {
+    console.error("Failed to load plan:", error);
+  }
+}
+
+async function loadChatHistory(runId) {
+  try {
+    const response = await fetch(`/v1/runs/${runId}/planner/chat/history`);
+    if (response.ok) {
+      const data = await response.json();
+      state.plannerChatMessages = data.messages || [];
+      renderChatMessages();
+    }
+  } catch (error) {
+    console.error("Failed to load chat history:", error);
+  }
+}
+
+async function sendPlannerMessage() {
+  const textarea = document.getElementById("chat-message");
+  const message = textarea.value.trim();
+  if (!message || !state.currentRunId) return;
+  
+  textarea.value = "";
+  
+  // Add user message to UI
+  state.plannerChatMessages.push({ role: "user", content: message });
+  renderChatMessages();
+  
+  try {
+    const response = await fetch(`/v1/runs/${state.currentRunId}/planner/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message }),
+    });
+    if (response.ok) {
+      const data = await response.json();
+      state.plannerChatMessages = data.messages || [];
+      renderChatMessages();
+      
+      // Reload plan after refinement
+      loadPlan(state.currentRunId);
+    }
+  } catch (error) {
+    console.error("Failed to send message:", error);
+  }
+}
+
+function renderChatMessages() {
+  const container = document.getElementById("chat-messages");
+  if (!container) return;
+  
+  container.replaceChildren();
+  
+  state.plannerChatMessages.forEach((msg) => {
+    const messageDiv = document.createElement("div");
+    messageDiv.className = `chat-message ${msg.role}`;
+    const roleLabel = document.createElement("span");
+    roleLabel.className = "chat-role";
+    roleLabel.textContent = msg.role === "user" ? "You:" : "Planner:";
+    const content = document.createElement("p");
+    content.textContent = msg.content;
+    messageDiv.append(roleLabel, content);
+    container.appendChild(messageDiv);
+  });
+  
+  container.scrollTop = container.scrollHeight;
+}
+
+function renderPlan() {
+  if (!state.currentPlan) return;
+  
+  // Create plan display section
+  let planSection = document.getElementById("plan-section");
+  if (!planSection) {
+    planSection = document.createElement("section");
+    planSection.className = "section";
+    planSection.id = "plan-section";
+    const mainContent = document.querySelector(".main-content");
+    if (mainContent) {
+      mainContent.appendChild(planSection);
+    }
+  }
+  
+  planSection.replaceChildren();
+  
+  const heading = document.createElement("h2");
+  heading.textContent = "Test Plan";
+  
+  const statusBadge = document.createElement("span");
+  statusBadge.className = `plan-status ${state.currentPlan.status}`;
+  statusBadge.textContent = state.currentPlan.status;
+  heading.append(statusBadge);
+  
+  const planContent = document.createElement("div");
+  planContent.className = "plan-content";
+  
+  // Render phases - use direct phases field (simplified storage)
+  const phases = state.currentPlan.phases || [];
+  phases.forEach((phase) => {
+    const phaseDiv = document.createElement("div");
+    phaseDiv.className = "plan-phase";
+    phaseDiv.innerHTML = `
+      <h4>Phase ${phase.phase}: ${phase.name}</h4>
+      <p><strong>Interface:</strong> ${phase.interface}</p>
+      <p><strong>Depends on:</strong> ${phase.depends_on.join(", ") || "None"}</p>
+      <p><strong>Verifications:</strong></p>
+      <ul>
+        ${phase.verifications.map(v => `<li>${v}</li>`).join("")}
+      </ul>
+    `;
+    planContent.appendChild(phaseDiv);
+  });
+  
+  // Add action buttons
+  const actionsDiv = document.createElement("div");
+  actionsDiv.className = "plan-actions";
+  
+  if (state.currentPlan.status === "draft") {
+    const approveButton = document.createElement("button");
+    approveButton.textContent = "Approve Plan";
+    approveButton.className = "approve-btn";
+    approveButton.addEventListener("click", () => approvePlan());
+    
+    const rejectButton = document.createElement("button");
+    rejectButton.textContent = "Reject Plan";
+    rejectButton.className = "reject-btn";
+    rejectButton.addEventListener("click", () => rejectPlan());
+    
+    actionsDiv.append(approveButton, rejectButton);
+  } else if (state.currentPlan.status === "approved") {
+    // Add re-run button if plan is approved but not currently running
+    const isRunning = state.currentRun && state.currentRun.status === "running";
+    if (!isRunning) {
+      const rerunButton = document.createElement("button");
+      rerunButton.textContent = "Re-run Plan";
+      rerunButton.className = "approve-btn";
+      rerunButton.addEventListener("click", () => rerunPlan());
+      actionsDiv.appendChild(rerunButton);
+    }
+  }
+  
+  const downloadButton = document.createElement("button");
+  downloadButton.textContent = "Download Plan (JSON)";
+  downloadButton.className = "download-btn";
+  downloadButton.addEventListener("click", () => downloadPlan("json"));
+  
+  actionsDiv.appendChild(downloadButton);
+  
+  planSection.append(heading, planContent, actionsDiv);
+}
+
+async function approvePlan() {
+  if (!state.currentRunId) return;
+  
+  try {
+    const response = await fetch(`/v1/runs/${state.currentRunId}/plan/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user: "user" }),
+    });
+    if (response.ok) {
+      state.currentPlan = await response.json();
+      renderPlan();
+      // Execution is started automatically by the approve endpoint
+    }
+  } catch (error) {
+    console.error("Failed to approve plan:", error);
+  }
+}
+
+async function rerunPlan() {
+  if (!state.currentRunId) return;
+  
+  try {
+    const response = await fetch(`/v1/runs/${state.currentRunId}:start`, { method: "POST" });
+    if (response.ok) {
+      console.log("Re-run started");
+      // Ensure the run is being watched for updates
+      watchRun(state.currentRunId);
+      // Refresh the plan to update the button state
+      renderPlan();
+    }
+  } catch (error) {
+    console.error("Failed to re-run plan:", error);
+  }
+}
+
+async function rejectPlan() {
+  if (!state.currentRunId) return;
+  
+  const reason = prompt("Reason for rejection:");
+  if (!reason) return;
+  
+  try {
+    const response = await fetch(`/v1/runs/${state.currentRunId}/plan/reject`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+    if (response.ok) {
+      state.currentPlan = await response.json();
+      renderPlan();
+    }
+  } catch (error) {
+    console.error("Failed to reject plan:", error);
+  }
+}
+
+async function downloadPlan(format) {
+  if (!state.currentRunId) return;
+  
+  try {
+    const response = await fetch(`/v1/runs/${state.currentRunId}/plan/download?format=${format}`);
+    if (response.ok) {
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `plan-${state.currentRunId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  } catch (error) {
+    console.error("Failed to download plan:", error);
   }
 }
 

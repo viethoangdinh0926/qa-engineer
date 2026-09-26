@@ -49,6 +49,12 @@ _JUDGE_SYSTEM = (
     "If the assertion says standard error or stderr is empty, pass only when stderr is empty. "
     "stdout length and stderr length are exact. Length 0 means that stream is empty. "
     "If the assertion says stdout is not empty, pass that part only when stdout length is greater than 0. "
+    "IMPORTANT: For CLI commands, the exit_code is the definitive indicator of success or failure. "
+    "If exit_code is non-zero, the command FAILED regardless of stderr content. "
+    "Only analyze stderr/stdout for content-based checks when exit_code is 0. "
+    "IMPORTANT: Python errors are ALWAYS errors, not warnings. "
+    "If the text contains Python errors like ModuleNotFoundError, ImportError, NameError, SyntaxError, TypeError, ValueError, KeyError, AttributeError, or any other Python exception, the verification FAILED. "
+    "Python tracebacks starting with 'Traceback (most recent call last):' are always errors. "
     "The question may be a sentence or a check such as contains:TEXT. "
     "Reply with one JSON object and no other text. "
     'Keys: "passed" (true or false) and "judgment" '
@@ -94,10 +100,26 @@ def _sample(text: str, limit: int = _SAMPLE_LIMIT) -> str:
 def present_for_judge(page_source: str, question: str = "") -> str:
     """Show a command stream only when the assertion mentions that stream."""
     marker = "\n\nstderr:\n"
+    
+    # Check if exit_code is present in the evidence
+    exit_code_marker = "\nexit_code:"
+    exit_code = None
+    if exit_code_marker in page_source:
+        parts = page_source.split(exit_code_marker)
+        if len(parts) > 1:
+            exit_code = parts[1].strip().split()[0] if parts[1].strip() else None
+            # Remove exit_code from page_source for further processing
+            page_source = parts[0]
+    
     if page_source.startswith("stdout:") and marker in page_source:
         stdout, stderr = page_source.rsplit(marker, 1)
         stdout = stdout.removeprefix("stdout:\n").removeprefix("stdout:")
         parts: list[str] = []
+        
+        # Always include exit code if available
+        if exit_code is not None:
+            parts.append(f"exit_code: {exit_code}")
+        
         if mentions_stdout(question):
             parts.append(f"stdout length: {len(stdout)} characters\nstdout:\n{_sample(stdout)}")
         if mentions_stderr(question):
@@ -105,6 +127,11 @@ def present_for_judge(page_source: str, question: str = "") -> str:
         if not parts:
             return "The command finished. stdout and stderr are not part of this check."
         return "\n\n".join(parts)
+    
+    # For non-stdout/stderr format, include exit code if available
+    if exit_code is not None:
+        return f"exit_code: {exit_code}\n\n{_sample(page_source.strip(), 8_000)}"
+    
     return _sample(page_source.strip(), 8_000)
 
 

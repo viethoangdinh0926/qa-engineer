@@ -1,5 +1,6 @@
 """Pydantic payloads and the LangGraph state dictionary."""
 
+from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
@@ -26,7 +27,6 @@ RunStatus = Literal[
 Verdict = Literal["pass", "fail", "error", "rejected", "canceled"]
 ReasonCode = Literal[
     "assertion_failed",
-    "sandbox_start_failed",
     "browser_launch_failed",
     "desktop_input_failed",
     "driver_timeout",
@@ -37,12 +37,13 @@ ReasonCode = Literal[
     "coding_agent_failed",
     "coding_agent_not_available",
 ]
+PlanStatus = Literal["draft", "approved", "rejected", "executing", "completed"]
 
 
 class GUIAction(BaseModel):
     """One pixel or locator action inside a GUI step."""
 
-    action: Literal["click", "type", "press", "goto"]
+    action: Literal["click", "type", "press", "goto", "run"]
     coordinate: list[int] | None = None
     selector: dict[str, str] | None = None
     text: str | None = None
@@ -51,10 +52,12 @@ class GUIAction(BaseModel):
 class CodingAction(BaseModel):
     """One coding operation for the Pi coding agent."""
 
-    action: Literal["create_file", "update_file", "review_code", "execute_code"]
+    action: Literal["create_file", "update_file", "review_code", "execute_code", "run"]
     file_path: str | None = None
     content: str | None = None
     description: str | None = None
+    command: str | None = None
+    timeout: int | None = None
 
 
 class TestPhase(BaseModel):
@@ -198,6 +201,37 @@ class PlanResult(BaseModel):
     steps: list[TestStep] = Field(default_factory=list)
 
 
+class PlanStorage(BaseModel):
+    """Stored plan with approval status."""
+
+    run_id: str
+    status: PlanStatus = "draft"
+    phases: list[TestPhase] = Field(default_factory=list)
+    steps: list[TestStep] = Field(default_factory=list)
+    approved_at: datetime | None = None
+    approved_by: str | None = None  # User identifier
+    rejection_reason: str | None = None
+
+
+class PlannerMessage(BaseModel):
+    """A message in the planner chat."""
+
+    role: Literal["user", "assistant"]
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class PlannerChatHistory(BaseModel):
+    """Chat history for planner interaction."""
+
+    run_id: str
+    messages: list[PlannerMessage] = Field(default_factory=list)
+
+    def add_message(self, role: Literal["user", "assistant"], content: str) -> None:
+        """Add a message to the chat history."""
+        self.messages.append(PlannerMessage(role=role, content=content))
+
+
 class AgentState(TypedDict, total=False):
     """LangGraph state. Step payloads are stored as plain dicts."""
 
@@ -209,11 +243,13 @@ class AgentState(TypedDict, total=False):
     attempt_counts: dict[str, int]
     phase: str
     step_views: list[dict[str, Any]]
+    max_retries: int
     last_result: dict[str, Any] | None
     report: dict[str, Any] | None
     reason_code: str | None
     reason: str | None
     missing: list[str]
+    coding_instructions: list[dict[str, Any]]  # Track LLM's instructions to coding agent
 
 
 def status_for_verdict(verdict: Verdict) -> RunStatus:

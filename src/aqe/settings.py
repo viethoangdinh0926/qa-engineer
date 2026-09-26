@@ -31,7 +31,6 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     ollama_base_url: str | None = "http://127.0.0.1:11434"
     target_url: str = "http://127.0.0.1:8765"
-    sandbox_image: str = "aqe-sandbox:local"
     max_retries: int = 1
     spec_max_bytes: int = Field(default=100 * 1024)
     spec_path: str | None = None

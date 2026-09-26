@@ -1,4 +1,4 @@
-"""Live browser and sandbox checks. Skipped when the host cannot run them."""
+"""Live browser checks. Skipped when the host cannot run them."""
 
 import socket
 import threading
@@ -24,14 +24,9 @@ def _free_port() -> int:
 def test_live_registration(tmp_path: Path) -> None:
     config = EngineConfig(runs_dir=tmp_path / "runs")
     capabilities = probe_host(config)
-    if not capabilities.browser.available or not capabilities.sandbox.available:
+    if not capabilities.browser.available:
         pytest.skip(
-            " ".join(
-                detail
-                for detail in (capabilities.browser.detail, capabilities.sandbox.detail)
-                if detail
-            )
-            or "live drivers are unavailable"
+            capabilities.browser.detail or "browser driver is unavailable"
         )
     import importlib.util
 

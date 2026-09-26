@@ -12,16 +12,17 @@ from pathlib import Path
 from typing import Any
 
 from aqe.capabilities import Probe, probe_host
-from aqe.cli_runtime.sandbox import build_sandbox
 from aqe.cli_runtime.synthesizer import CLISubsystem
 from aqe.coding_agent.subsystem import CodingSubsystem, build_coding_agent
 from aqe.config import EngineConfig
-from aqe.errors import HarnessError, SpecValidationError
+from aqe.errors import SpecValidationError
 from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
 from aqe.gui.subsystem import GUISubsystem, build_gui
+from aqe.plan_storage import PlanStorageManager
 from aqe.judge import PageJudge
 from aqe.llm import Planner, build_planner
-from aqe.state import TERMINAL_STATUSES, AgentState, status_for_verdict
+from aqe.plan_storage import PlanStorageManager
+from aqe.state import AgentState, PlanStorage, TERMINAL_STATUSES, status_for_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,6 @@ class RunService:
         *,
         planner: Planner | None = None,
         gui: GUISubsystem | None = None,
-        sandbox: Any | None = None,
         coding: CodingSubsystem | None = None,
         judge: PageJudge | None = None,
         probe: Probe | None = None,
@@ -56,9 +56,8 @@ class RunService:
     ) -> None:
         self.config = config or EngineConfig()
         self.config.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.planner = planner
+        self.planner = planner or build_planner(self.config)
         self.gui = gui
-        self.sandbox = sandbox
         self.coding = coding
         self.judge = judge
         self.probe = probe or (lambda: probe_host(self.config))
@@ -66,7 +65,7 @@ class RunService:
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.Lock()
 
-    def submit(self, specification: str, *, run_id: str | None = None) -> dict[str, Any]:
+    def submit(self, specification: str, *, run_id: str | None = None, wait_for_approval: bool = True) -> dict[str, Any]:
         self._validate(specification)
         record = RunRecord(
             id=run_id or uuid.uuid4().hex,
@@ -75,6 +74,28 @@ class RunService:
         with self._lock:
             self._runs[record.id] = record
         self._remember(record)
+        
+        # Generate initial plan and store it
+        plan_result = self.planner.plan(specification)
+        
+        if plan_result.accepted:
+            # Create plan storage
+            plan_storage = PlanStorageManager(self.config.runs_dir)
+            plan = PlanStorage(
+                run_id=record.id,
+                status="draft" if wait_for_approval else "approved",
+                phases=plan_result.phases,
+                steps=plan_result.steps,
+            )
+            plan_storage.save_plan(plan)
+            
+            # If waiting for approval, don't start execution yet
+            if wait_for_approval:
+                record.status = "submitted"
+                self._remember(record)
+                return self.snapshot(record)
+        
+        # Start execution immediately if not waiting for approval or plan was rejected
         thread = threading.Thread(target=self._execute, args=(record.id,), daemon=True)
         thread.start()
         return self.snapshot(record)
@@ -93,6 +114,54 @@ class RunService:
         if record is None:
             return None
         record.control.cancel_requested = True
+        return self.snapshot(record)
+
+    def start_execution(self, run_id: str) -> dict[str, Any] | None:
+        """Start execution for a run that was waiting for plan approval or re-trigger execution for a completed/failed run."""
+        print(f"[DEBUG] start_execution called for {run_id}")
+        record = self._runs.get(run_id)
+        if record is None:
+            print(f"[DEBUG] Record not found for {run_id}")
+            return None
+        
+        print(f"[DEBUG] Record found, status: {record.status}")
+        
+        # Check if plan is approved
+        plan_storage = PlanStorageManager(self.config.runs_dir)
+        plan = plan_storage.load_plan(run_id)
+        if not plan or plan.status != "approved":
+            print(f"[DEBUG] Plan not found or not approved: {plan.status if plan else 'None'}")
+            return {"error": "Plan not found or not approved."}
+        
+        print(f"[DEBUG] Plan approved, checking record status")
+        
+        # Cancel any existing execution that is currently running
+        if record.status in ["running", "working"]:
+            print(f"[DEBUG] Canceling existing execution, status: {record.status}")
+            record.control.cancel_requested = True
+            # Wait a moment for cancellation to take effect
+            import time
+            time.sleep(0.5)
+        
+        print(f"[DEBUG] Resetting run record")
+        # Reset the run record for new execution
+        record.status = "running"
+        record.ready = False
+        record.steps = []
+        record.execution_history = []
+        record.snapshots = []
+        record.report = None
+        record.error = None
+        record.control = RunControl()
+        record.done = threading.Event()
+        self._remember(record)
+        
+        print(f"[DEBUG] Starting execution thread")
+        # Start execution
+        thread = threading.Thread(target=self._execute, args=(run_id,), daemon=True)
+        thread.start()
+        
+        print(f"[DEBUG] Execution thread started, returning snapshot")
         return self.snapshot(record)
 
     def wait(self, run_id: str, timeout: float | None = None) -> dict[str, Any]:
@@ -165,23 +234,19 @@ class RunService:
 
         gui = None
         coding = None
-        sandbox = None
         try:
-            config = self.config
-            planner = self.planner or build_planner(config)
-            gui = self.gui or build_gui(config)
-            sandbox = self.sandbox or build_sandbox(config)
-            coding = self.coding or build_coding_agent(config.runs_dir, config.pi_llm_model)
+            gui = self.gui or build_gui(self.config)
+            coding = self.coding or build_coding_agent(self.config.runs_dir, self.config.pi_llm_model)
             evidence = self.run_dir(run_id) / "evidence"
             evidence.mkdir(parents=True, exist_ok=True)
             work_dir = self.run_dir(run_id) / "work"
             work_dir.mkdir(parents=True, exist_ok=True)
 
             deps = GraphDeps(
-                config=config,
-                planner=planner,
+                config=self.config,
+                planner=self.planner,
                 gui=gui,
-                cli=CLISubsystem(planner, sandbox),
+                cli=CLISubsystem(self.planner, work_dir),
                 coding=coding,
                 control=record.control,
                 probe=self.probe,
@@ -192,37 +257,43 @@ class RunService:
                 work_dir=work_dir,
             )
 
-            # Check capabilities before starting graph to avoid sandbox start if unavailable
-            capabilities = self.probe()
-            if not capabilities.sandbox.available:
-                # Skip sandbox start if unavailable
-                deps.run_dir = None
-                deps.work_dir = None
+            state = initial_state(record.id, record.specification)
+            
+            # Check if there's an approved plan to use
+            plan_storage = PlanStorageManager(self.config.runs_dir)
+            plan = plan_storage.load_plan(run_id)
+            
+            if plan and plan.status == "approved":
+                # Use the approved plan, skip plan generation
+                print(f"[DEBUG] Using approved plan for {run_id}: {len(plan.phases)} phases, {len(plan.steps)} steps")
+                # Convert steps to the format expected by the graph
+                step_dicts = [step.model_dump() for step in plan.steps]
+                print(f"[DEBUG] Step dicts: {step_dicts[:1] if step_dicts else 'empty'}")
+                state["test_matrix"] = step_dicts
+                state["step_views"] = step_dicts
+                state["current_step"] = 0  # Initialize current_step
+                state["phase"] = "preflight"  # Skip to preflight
             else:
-                # Start the shared sandbox container for this run
-                try:
-                    sandbox.start_container(self.run_dir(run_id), work_dir)
-                except HarnessError as exc:
-                    # Handle sandbox start failures specifically
-                    record.status = "failed"
-                    record.ready = True
-                    record.error = str(exc)
-                    record.report = {
-                        "schema_version": "1",
-                        "id": run_id,
-                        "verdict": "error",
-                        "specification": record.specification,
-                        "reason_code": exc.code,
-                        "reason": str(exc),
-                        "missing": [],
-                        "steps": record.steps,
-                    }
-                    self._write_report(record)
-                    self._remember(record)
-                    return
-
-            run_graph(deps, initial_state(run_id, record.specification), publish)
+                # No approved plan, generate normally
+                print(f"[DEBUG] No approved plan found, generating normally")
+                pass
+            
+            print(f"[DEBUG] Starting graph execution with phase: {state['phase']}")
+            print(f"[DEBUG] test_matrix type: {type(state.get('test_matrix'))}, length: {len(state.get('test_matrix', []))}")
+            print(f"[DEBUG] step_views type: {type(state.get('step_views'))}, length: {len(state.get('step_views', []))}")
+            try:
+                state = run_graph(deps, state, publish)
+                print(f"[DEBUG] Graph execution completed")
+            except Exception as e:
+                print(f"[DEBUG] Graph execution failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+                    
         except Exception as exc:  # noqa: BLE001
+            print(f"[DEBUG] Execution failed with error: {exc}")
+            import traceback
+            traceback.print_exc()
             record.status = "failed"
             record.ready = True
             record.error = str(exc)
@@ -239,24 +310,30 @@ class RunService:
             self._write_report(record)
             self._remember(record)
         finally:
+            print(f"[DEBUG] In finally block")
             try:
                 if gui is not None:
+                    print(f"[DEBUG] Closing GUI subsystem")
                     closer = getattr(gui, "close", None)
                     if closer:
                         closer()
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                print(f"[DEBUG] Failed to close GUI subsystem: {e}")
                 logger.warning("Failed to close GUI subsystem")
             try:
                 if coding is not None:
+                    print(f"[DEBUG] Closing coding subsystem")
                     coding_closer = getattr(coding, "close", None)
                     if coding_closer:
                         coding_closer()
-            except Exception:  # noqa: BLE001
-                logger.warning("Failed to close coding subsystem")
+            except Exception as e:  # noqa: BLE001
+                print(f"[DEBUG] Failed to close coding subsystem: {e}")
+            print(f"[DEBUG] Finally block completed")
             if not record.ready:
                 record.ready = True
                 record.status = record.status if record.status in TERMINAL_STATUSES else "failed"
                 self._remember(record)
+            print(f"[DEBUG] _execute method completed for {run_id}")
             record.done.set()
 
     def _remember(self, record: RunRecord) -> None:

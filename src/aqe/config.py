@@ -14,7 +14,6 @@ class EngineConfig(BaseModel):
     llm: LlmProvider = "ollama"
     browser: Literal["playwright"] = "playwright"
     desktop: Literal["pyautogui"] = "pyautogui"
-    sandbox: Literal["docker"] = "docker"
     max_retries: int = 1
     spec_max_bytes: int = 100 * 1024
     runs_dir: Path = Field(default_factory=lambda: Path("runs"))
@@ -30,9 +29,6 @@ class EngineConfig(BaseModel):
     anthropic_api_key: str | None = None
     ollama_base_url: str | None = "http://127.0.0.1:11434"
     target_url: str = "http://127.0.0.1:8765"
-    sandbox_image: str = "aqe-sandbox:local"
-    sandbox_timeout_seconds: int = 30
-    sandbox_output_limit: int = 64 * 1024
     pi_llm_model: str | None = None
 
     @property
@@ -72,7 +68,6 @@ class EngineConfig(BaseModel):
             "anthropic_api_key": settings.anthropic_api_key,
             "ollama_base_url": settings.ollama_base_url,
             "target_url": settings.target_url,
-            "sandbox_image": settings.sandbox_image,
             "max_retries": settings.max_retries,
             "spec_max_bytes": settings.spec_max_bytes,
             "runs_dir": settings.runs_dir,

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-from google.protobuf.json_format import MessageToDict
-
 from a2a.helpers.proto_helpers import new_data_part, new_task_from_user_message
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -20,6 +18,7 @@ from a2a.types.a2a_pb2 import (
 )
 from a2a.utils.constants import PROTOCOL_VERSION_CURRENT
 from a2a.utils.errors import InvalidParamsError
+from google.protobuf.json_format import MessageToDict
 
 from aqe.errors import SpecValidationError
 from aqe.service import RunService

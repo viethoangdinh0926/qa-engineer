@@ -23,7 +23,7 @@ class DesktopDriver:
                 monitor = grabber.monitors[0]
                 shot = grabber.grab(monitor)
                 return mss.tools.to_png(shot.rgb, shot.size)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HarnessError("desktop_input_failed", f"Screen capture failed: {exc}") from exc
 
     def act(self, action: GUIAction) -> None:
@@ -40,7 +40,7 @@ class DesktopDriver:
                 pyautogui.write(action.text)
             elif action.action == "press" and action.text:
                 pyautogui.press(action.text)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HarnessError("desktop_input_failed", f"Desktop input failed: {exc}") from exc
 
     def _require_display(self) -> None:

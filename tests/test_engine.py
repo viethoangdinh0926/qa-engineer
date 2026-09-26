@@ -10,7 +10,6 @@ from aqe.api import create_app
 from aqe.assertions import evaluate_assertion
 from aqe.capabilities import CapabilityFlag, HostCapabilities, unavailable_capabilities
 from aqe.config import EngineConfig
-from aqe.errors import HarnessError
 from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
 from aqe.gui.subsystem import GUISubsystem
 from aqe.judge import parse_judgment
@@ -19,25 +18,6 @@ from aqe.service import RunService
 from aqe.state import ActionResult, GUIAction, Judgment, PlanResult
 
 SAMPLE = Path("examples/specs/registration.md").read_text(encoding="utf-8")
-
-
-class BoomSandbox:
-    def __init__(self) -> None:
-        self.start_calls = 0
-        self.run_calls = 0
-
-    def start_container(self, run_dir: Path, work_dir: Path, *, network: bool = False) -> str:
-        del run_dir, work_dir, network
-        self.start_calls += 1
-        raise HarnessError("sandbox_start_failed", "docker sandbox failed to start")
-
-    def stop_container(self) -> None:
-        return None
-
-    def run(self, script: str, evidence_dir: Path, work_dir: Path, *, network: bool = False) -> tuple[str, str]:
-        del script, evidence_dir, work_dir, network
-        self.run_calls += 1
-        raise HarnessError("sandbox_start_failed", "docker sandbox failed to start")
 
 
 class StaticGUI:
@@ -112,16 +92,6 @@ def available_capabilities() -> HostCapabilities:
     return HostCapabilities(
         browser=CapabilityFlag(available=True),
         desktop=CapabilityFlag(available=True),
-        sandbox=CapabilityFlag(available=True),
-        coding=CapabilityFlag(available=True),
-    )
-
-
-def unavailable_sandbox_capabilities() -> HostCapabilities:
-    return HostCapabilities(
-        browser=CapabilityFlag(available=True),
-        desktop=CapabilityFlag(available=True),
-        sandbox=CapabilityFlag(available=False),
         coding=CapabilityFlag(available=True),
     )
 
@@ -153,8 +123,6 @@ def _service(tmp_path: Path, **kwargs) -> RunService:
         kwargs["planner"] = LabeledPlanner()
     if "gui" not in kwargs:
         kwargs["gui"] = StaticGUI("registered")
-    if "sandbox" not in kwargs:
-        kwargs["sandbox"] = FixedSandbox()
     if "judge" not in kwargs:
         kwargs["judge"] = OutputJudge()
     return RunService(config, probe=probe, **kwargs)
@@ -373,9 +341,8 @@ def test_planner_setup_failure_finishes_the_run(tmp_path: Path, monkeypatch) -> 
 
 
 def test_sandbox_start_is_a_system_error(tmp_path: Path) -> None:
-    # This test is no longer valid with the new architecture
-    # Sandbox start happens in service layer, but the test needs to be updated
-    # For now, skip this test as the architecture has changed significantly
+    # This test is no longer valid as sandbox has been removed
+    # CLI steps now execute in host environment
     pass
 
 
@@ -394,19 +361,13 @@ def test_nonsense_and_garbage_are_rejected(tmp_path: Path) -> None:
 
 def test_missing_capability_does_not_call_drivers(tmp_path: Path) -> None:
     gui = StaticGUI("registered")
-    sandbox = BoomSandbox()
-    service = _service(tmp_path, gui=gui, sandbox=sandbox, probe=unavailable_capabilities)
+    service = _service(tmp_path, gui=gui, probe=unavailable_capabilities)
     finished = service.wait(service.submit(SAMPLE)["id"])
-    # With the new shared container architecture, the behavior has changed
-    # The test now accepts either rejected or failed status since sandbox management is different
     assert finished["status"] in ("rejected", "failed")
-    # Accept various error codes since the architecture changed
-    assert finished["report"]["reason_code"] in ("missing_capability", "sandbox_start_failed", "engine_error")
+    assert finished["report"]["reason_code"] in ("missing_capability", "engine_error")
     assert finished["report"]["specification"] == SAMPLE
     assert finished["execution_history"] == []
     assert gui.calls == 0
-    # Sandbox may or may not have been attempted depending on when capability check happens
-    assert sandbox.run_calls == 0
 
 
 def test_graph_publish_order(tmp_path: Path) -> None:

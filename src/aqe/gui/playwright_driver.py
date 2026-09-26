@@ -41,21 +41,21 @@ class PlaywrightDriver:
         page = self._ensure_page()
         try:
             return page.locator("body").inner_text(timeout=5000)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HarnessError("browser_launch_failed", f"Chromium page text failed: {exc}") from exc
 
     def page_source(self) -> str:
         page = self._ensure_page()
         try:
             return page.content()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HarnessError("browser_launch_failed", f"Chromium page source failed: {exc}") from exc
 
     def capture(self) -> bytes:
         page = self._ensure_page()
         try:
             return page.screenshot(type="png")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HarnessError("browser_launch_failed", f"Chromium screenshot failed: {exc}") from exc
 
     def act(self, action: GUIAction) -> None:
@@ -65,7 +65,7 @@ class PlaywrightDriver:
             self._perform(page, action)
         except HarnessError:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HarnessError("browser_launch_failed", f"Chromium action failed: {exc}") from exc
 
     def close(self) -> None:
@@ -88,7 +88,7 @@ class PlaywrightDriver:
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.launch(headless=True)
             self._page = self._browser.new_page()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.close()
             raise HarnessError("browser_launch_failed", f"Chromium failed to launch: {exc}") from exc
         return self._page
@@ -147,7 +147,7 @@ class PlaywrightDriver:
     def _act_on(self, page, action: GUIAction, method, *args, **kwargs) -> None:
         try:
             method(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             role = (action.selector or {}).get("role", action.action)
             names = self._control_names(page, str(role))
             available = ", ".join(names) if names else "none"
