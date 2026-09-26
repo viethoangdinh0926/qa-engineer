@@ -324,6 +324,13 @@ def test_streams_are_shown_only_when_the_assertion_mentions_them() -> None:
     neither = present_for_judge(command, "The curl command executes.")
     assert "xxxx" not in neither
     assert "boom" not in neither
+    with_code = "stdout:\nhello\n\nstderr:\n\n\nexit_code: 1"
+    empty_stderr = present_for_judge(with_code, "stderr is empty.")
+    assert "stderr length: 0 characters" in empty_stderr
+    assert "exit_code" not in empty_stderr
+    about_exit = present_for_judge(with_code, "The command exits with status 1.")
+    assert "exit_code: 1" in about_exit
+    assert "hello" not in about_exit
 
 
 def test_planner_setup_failure_finishes_the_run(tmp_path: Path, monkeypatch) -> None:
@@ -382,11 +389,20 @@ def test_graph_publish_order(tmp_path: Path) -> None:
     gui = StaticGUI("registered")
     from aqe.cli_runtime.synthesizer import CLISubsystem
 
+    class IdleCoding:
+        def execute_coding_action(self, step, evidence_dir):
+            del step, evidence_dir
+            raise AssertionError("coding was not requested")
+
+        def close(self) -> None:
+            return None
+
     deps = GraphDeps(
         config=config,
         planner=planner,
         gui=gui,
-        cli=CLISubsystem(planner, FixedSandbox()),
+        cli=CLISubsystem(planner, tmp_path / "work"),
+        coding=IdleCoding(),
         control=RunControl(),
         probe=available_capabilities,
         evidence_dir_for=lambda run_id: str(tmp_path / run_id),
@@ -411,7 +427,7 @@ def test_api_contract(tmp_path: Path) -> None:
         assert blank.status_code == 400
         assert "error" in blank.json()
 
-        created = client.post("/v1/runs", json={"specification": SAMPLE})
+        created = client.post("/v1/runs", json={"specification": SAMPLE, "wait_for_approval": False})
         assert created.status_code == 202
         run_id = created.json()["id"]
         waiting = client.get(f"/v1/runs/{run_id}")
@@ -513,3 +529,77 @@ def test_a2a_send_and_get_task(tmp_path: Path) -> None:
         same = service.get(task_id)
         assert same is not None
         assert same["report"]["verdict"] == "pass"
+
+
+def test_running_execution_is_not_replaced(tmp_path: Path) -> None:
+    pause = threading.Event()
+    service = _service(tmp_path, pause=pause)
+    snapshot = service.submit(SAMPLE)
+    current = snapshot
+    for _ in range(50):
+        current = service.get(snapshot["id"]) or current
+        if current["status"] == "working":
+            break
+        threading.Event().wait(0.05)
+    blocked = service.start_execution(snapshot["id"])
+    assert blocked is not None
+    assert blocked["error"] == "An execution is already in progress."
+    pause.set()
+    finished = service.wait(snapshot["id"])
+    assert finished["report"]["verdict"] == "pass"
+
+
+def test_finished_plan_can_run_again(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    finished = service.wait(service.submit(SAMPLE)["id"])
+    assert finished["report"]["verdict"] == "pass"
+    again = service.start_execution(finished["id"])
+    assert again is not None
+    assert "error" not in again
+    second = service.wait(finished["id"])
+    assert second["report"]["verdict"] == "pass"
+
+
+def test_saved_run_reloads_its_state(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    finished = service.wait(service.submit(SAMPLE)["id"])
+    restored = _service(tmp_path)
+    again = restored.get(finished["id"])
+    assert again is not None
+    assert again["specification"] == SAMPLE
+    assert again["ready"] is True
+    assert again["report"]["verdict"] == "pass"
+    assert again["steps"]
+
+
+def test_coding_and_desktop_phases_are_not_executable() -> None:
+    from aqe.llm import _validate_phases
+    from aqe.state import TestPhase
+
+    coding = _validate_phases(
+        [
+            TestPhase(
+                phase=1,
+                name="Write a file",
+                interface="CODING",
+                operation_notes=["create file"],
+                verifications=["The file exists."],
+            )
+        ]
+    )
+    assert coding is not None
+    assert "not executable" in coding
+    desktop = _validate_phases(
+        [
+            TestPhase(
+                phase=1,
+                name="Click Save",
+                interface="GUI",
+                gui_driver="desktop",
+                operation_notes=["click Save"],
+                verifications=["The page shows saved."],
+            )
+        ]
+    )
+    assert desktop is not None
+    assert "Desktop" in desktop

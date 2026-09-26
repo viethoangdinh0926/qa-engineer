@@ -20,11 +20,9 @@ from aqe.a2a_agent import (
     build_agent_card,
 )
 from aqe.config import EngineConfig
-from aqe.errors import SpecValidationError
+from aqe.errors import AgentBusyError, SpecValidationError
 from aqe.plan_storage import PlanStorageManager
 from aqe.service import RunService
-from aqe.state import PlannerChatHistory
-
 UI_DIR = Path(__file__).resolve().parent / "ui"
 
 
@@ -53,7 +51,9 @@ def create_app(service: RunService | None = None, *, public_url: str = "http://1
             snapshot = engine.submit(body.specification, wait_for_approval=wait_for_approval)
         except SpecValidationError as exc:
             return JSONResponse({"error": exc.message}, status_code=400)
-        return {"id": snapshot["id"], "status": snapshot["status"]}
+        except AgentBusyError as exc:
+            return JSONResponse({"error": exc.message}, status_code=409)
+        return snapshot
 
     @app.get("/v1/runs")
     def list_runs() -> dict[str, list]:
@@ -80,7 +80,9 @@ def create_app(service: RunService | None = None, *, public_url: str = "http://1
         if snapshot is None:
             return JSONResponse({"error": "Run not found."}, status_code=404)
         if "error" in snapshot:
-            return JSONResponse(snapshot, status_code=400)
+            message = str(snapshot["error"])
+            status = 409 if "already" in message or "processing" in message else 400
+            return JSONResponse(snapshot, status_code=status)
         return snapshot
 
     @app.get("/v1/runs/{run_id}/events")
@@ -106,49 +108,15 @@ def create_app(service: RunService | None = None, *, public_url: str = "http://1
         message = body.get("message", "")
         if not message:
             return JSONResponse({"error": "Message is required."}, status_code=400)
-        
-        # Get or create chat history
-        plan_storage = PlanStorageManager(engine.config.runs_dir)
-        chat = plan_storage.load_chat_history(run_id) or PlannerChatHistory(run_id=run_id)
-        
-        # Add user message
-        chat.add_message("user", message)
-        
-        # Get current plan
-        plan = plan_storage.load_plan(run_id)
-        if not plan:
-            chat.add_message("assistant", "No plan exists yet. Please create a run first.")
-            plan_storage.save_chat_history(chat)
-            return {"messages": [msg.model_dump(mode="json") for msg in chat.messages]}
-        
-        # Get current plan phases and steps
-        phases, steps = plan.phases, plan.steps
-        
-        # Get planner and refine plan
-        planner = engine.planner
-        if hasattr(planner, 'refine_plan'):
-            chat_history = [msg.model_dump(mode="json") for msg in chat.messages]
-            refined_phases, refined_steps, reasoning = planner.refine_plan(
-                phases, steps, message, chat_history
-            )
-            
-            # Check if the plan was actually updated
-            if refined_phases == phases and refined_steps == steps:
-                # No changes made - likely just an answer to a question
-                chat.add_message("assistant", reasoning)
-            else:
-                # Plan was updated - directly set the new phases and steps
-                plan.phases = refined_phases
-                plan.steps = refined_steps
-                plan_storage.save_plan(plan)
-                chat.add_message("assistant", f"Plan updated. {reasoning}")
-        else:
-            chat.add_message("assistant", "Planner does not support plan refinement.")
-        
-        # Save chat history
-        plan_storage.save_chat_history(chat)
-        
-        return {"messages": [msg.model_dump(mode="json") for msg in chat.messages]}
+        try:
+            result = engine.discuss_plan(run_id, message)
+        except AgentBusyError as exc:
+            return JSONResponse({"error": exc.message}, status_code=409)
+        if result is None:
+            return JSONResponse({"error": "Run not found."}, status_code=404)
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return result
 
     @app.get("/v1/runs/{run_id}/planner/chat/history")
     def get_planner_chat_history(run_id: str):
@@ -207,19 +175,18 @@ def create_app(service: RunService | None = None, *, public_url: str = "http://1
         if not plan:
             return JSONResponse({"error": "Plan not found."}, status_code=404)
         
-        # If plan is already approved, cancel current execution and restart
-        if plan.status == "approved":
-            # Cancel current execution if running
-            engine.cancel(run_id)
-        
-        # Update plan status
+        if engine.agent_busy():
+            return JSONResponse({"error": "The agent is still processing a request."}, status_code=409)
+        if engine.execution_in_progress(run_id):
+            return JSONResponse({"error": "An execution is already in progress."}, status_code=409)
+
         plan.status = "approved"
         plan.approved_by = body.get("user", "unknown")
         plan_storage.save_plan(plan)
-        
-        # Start execution
-        engine.start_execution(run_id)
-        
+
+        started = engine.start_execution(run_id)
+        if started and "error" in started:
+            return JSONResponse(started, status_code=409)
         return plan.model_dump(mode="json")
 
     @app.post("/v1/runs/{run_id}/plan/reject")

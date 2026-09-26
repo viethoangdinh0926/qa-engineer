@@ -15,14 +15,13 @@ from aqe.capabilities import Probe, probe_host
 from aqe.cli_runtime.synthesizer import CLISubsystem
 from aqe.coding_agent.subsystem import CodingSubsystem, build_coding_agent
 from aqe.config import EngineConfig
-from aqe.errors import SpecValidationError
+from aqe.errors import AgentBusyError, SpecValidationError
 from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
 from aqe.gui.subsystem import GUISubsystem, build_gui
-from aqe.plan_storage import PlanStorageManager
 from aqe.judge import PageJudge
 from aqe.llm import Planner, build_planner
 from aqe.plan_storage import PlanStorageManager
-from aqe.state import AgentState, PlanStorage, TERMINAL_STATUSES, status_for_verdict
+from aqe.state import AgentState, PlanStorage, PlannerChatHistory, TERMINAL_STATUSES, status_for_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,7 @@ class RunRecord:
     control: RunControl = field(default_factory=RunControl)
     done: threading.Event = field(default_factory=threading.Event)
     error: str | None = None
+    generation: int = 0
 
 
 class RunService:
@@ -56,7 +56,7 @@ class RunService:
     ) -> None:
         self.config = config or EngineConfig()
         self.config.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.planner = planner or build_planner(self.config)
+        self.planner = planner
         self.gui = gui
         self.coding = coding
         self.judge = judge
@@ -64,22 +64,43 @@ class RunService:
         self.pause = pause
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.Lock()
+        self._activity = threading.Lock()
+        self._load_saved_runs()
 
-    def submit(self, specification: str, *, run_id: str | None = None, wait_for_approval: bool = True) -> dict[str, Any]:
+    def submit(self, specification: str, *, run_id: str | None = None, wait_for_approval: bool = False) -> dict[str, Any]:
         self._validate(specification)
+        if not self._activity.acquire(blocking=False):
+            raise AgentBusyError()
         record = RunRecord(
             id=run_id or uuid.uuid4().hex,
             specification=specification,
         )
-        with self._lock:
-            self._runs[record.id] = record
-        self._remember(record)
-        
-        # Generate initial plan and store it
-        plan_result = self.planner.plan(specification)
-        
-        if plan_result.accepted:
-            # Create plan storage
+        try:
+            with self._lock:
+                self._runs[record.id] = record
+            self._remember(record)
+
+            try:
+                planner = self._planner()
+            except Exception as exc:  # noqa: BLE001 - a missing client is an engine error
+                self._finish_error(record, str(exc))
+                return self.snapshot(record)
+            try:
+                plan_result = planner.plan(specification)
+            except Exception as exc:  # noqa: BLE001 - a planner crash is a rejected run
+                self._finish_rejected(
+                    record,
+                    f"planner output did not match the test plan schema: {exc}",
+                )
+                return self.snapshot(record)
+            if not plan_result.accepted:
+                self._finish_rejected(
+                    record,
+                    plan_result.reason or "This request has no verifiable GUI or CLI actions.",
+                    plan_result.reason_code or "not_a_test_plan",
+                )
+                return self.snapshot(record)
+
             plan_storage = PlanStorageManager(self.config.runs_dir)
             plan = PlanStorage(
                 run_id=record.id,
@@ -88,17 +109,59 @@ class RunService:
                 steps=plan_result.steps,
             )
             plan_storage.save_plan(plan)
-            
-            # If waiting for approval, don't start execution yet
             if wait_for_approval:
                 record.status = "submitted"
                 self._remember(record)
                 return self.snapshot(record)
-        
-        # Start execution immediately if not waiting for approval or plan was rejected
+        finally:
+            self._activity.release()
+
+        record.status = "running"
+        record.ready = False
+        self._remember(record)
         thread = threading.Thread(target=self._execute, args=(record.id,), daemon=True)
         thread.start()
         return self.snapshot(record)
+
+    def _planner(self) -> Planner:
+        if self.planner is None:
+            self.planner = build_planner(self.config)
+        return self.planner
+
+    def _finish_error(self, record: RunRecord, reason: str) -> None:
+        record.status = "failed"
+        record.ready = True
+        record.error = reason
+        record.report = {
+            "schema_version": "1",
+            "id": record.id,
+            "verdict": "error",
+            "specification": record.specification,
+            "reason_code": "engine_error",
+            "reason": reason,
+            "missing": [],
+            "steps": record.steps,
+        }
+        self._write_report(record)
+        self._remember(record)
+        record.done.set()
+
+    def _finish_rejected(self, record: RunRecord, reason: str, reason_code: str = "not_a_test_plan") -> None:
+        record.status = "rejected"
+        record.ready = True
+        record.report = {
+            "schema_version": "1",
+            "id": record.id,
+            "verdict": "rejected",
+            "specification": record.specification,
+            "reason_code": reason_code,
+            "reason": reason,
+            "missing": [],
+            "steps": [],
+        }
+        self._write_report(record)
+        self._remember(record)
+        record.done.set()
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         record = self._runs.get(run_id)
@@ -116,53 +179,91 @@ class RunService:
         record.control.cancel_requested = True
         return self.snapshot(record)
 
+    def agent_busy(self) -> bool:
+        if not self._activity.acquire(blocking=False):
+            return True
+        self._activity.release()
+        return False
+
+    def execution_in_progress(self, run_id: str) -> bool:
+        record = self._runs.get(run_id)
+        return record is not None and not record.ready and record.status in {"running", "working"}
+
     def start_execution(self, run_id: str) -> dict[str, Any] | None:
-        """Start execution for a run that was waiting for plan approval or re-trigger execution for a completed/failed run."""
-        print(f"[DEBUG] start_execution called for {run_id}")
+        """Start execution for an approved plan. A run already executing is left alone."""
         record = self._runs.get(run_id)
         if record is None:
-            print(f"[DEBUG] Record not found for {run_id}")
             return None
-        
-        print(f"[DEBUG] Record found, status: {record.status}")
-        
-        # Check if plan is approved
+        if self.agent_busy():
+            return {"error": "The agent is still processing a request."}
+
         plan_storage = PlanStorageManager(self.config.runs_dir)
         plan = plan_storage.load_plan(run_id)
         if not plan or plan.status != "approved":
-            print(f"[DEBUG] Plan not found or not approved: {plan.status if plan else 'None'}")
             return {"error": "Plan not found or not approved."}
-        
-        print(f"[DEBUG] Plan approved, checking record status")
-        
-        # Cancel any existing execution that is currently running
-        if record.status in ["running", "working"]:
-            print(f"[DEBUG] Canceling existing execution, status: {record.status}")
-            record.control.cancel_requested = True
-            # Wait a moment for cancellation to take effect
-            import time
-            time.sleep(0.5)
-        
-        print(f"[DEBUG] Resetting run record")
-        # Reset the run record for new execution
-        record.status = "running"
-        record.ready = False
-        record.steps = []
-        record.execution_history = []
-        record.snapshots = []
-        record.report = None
-        record.error = None
-        record.control = RunControl()
-        record.done = threading.Event()
+
+        with self._lock:
+            if self.execution_in_progress(run_id):
+                return {"error": "An execution is already in progress."}
+            record.generation += 1
+            record.status = "running"
+            record.ready = False
+            record.steps = []
+            record.execution_history = []
+            record.snapshots = []
+            record.report = None
+            record.error = None
+            record.control = RunControl()
+            record.done = threading.Event()
         self._remember(record)
-        
-        print(f"[DEBUG] Starting execution thread")
-        # Start execution
+
         thread = threading.Thread(target=self._execute, args=(run_id,), daemon=True)
         thread.start()
-        
-        print(f"[DEBUG] Execution thread started, returning snapshot")
         return self.snapshot(record)
+
+    def discuss_plan(self, run_id: str, message: str) -> dict[str, Any] | None:
+        """Answer a question or update the plan. Holds the agent until the reply is saved."""
+        record = self._runs.get(run_id)
+        if record is None:
+            return None
+        text = message.strip()
+        if not text:
+            return {"error": "Message is required."}
+        if not self._activity.acquire(blocking=False):
+            raise AgentBusyError()
+        try:
+            plan_storage = PlanStorageManager(self.config.runs_dir)
+            chat = plan_storage.load_chat_history(run_id) or PlannerChatHistory(run_id=run_id)
+            chat.add_message("user", text)
+            plan = plan_storage.load_plan(run_id)
+            if plan is None:
+                chat.add_message("assistant", "No plan exists yet. Please create a run first.")
+            else:
+                planner = self._planner()
+                if not hasattr(planner, "refine_plan"):
+                    chat.add_message("assistant", "Planner does not support plan refinement.")
+                else:
+                    history = [item.model_dump(mode="json") for item in chat.messages]
+                    refined_phases, refined_steps, reasoning = planner.refine_plan(
+                        plan.phases, plan.steps, text, history
+                    )
+                    changed = [phase.model_dump() for phase in refined_phases] != [
+                        phase.model_dump() for phase in plan.phases
+                    ] or [step.model_dump() for step in refined_steps] != [
+                        step.model_dump() for step in plan.steps
+                    ]
+                    if changed:
+                        plan.phases = refined_phases
+                        plan.steps = refined_steps
+                        plan.status = "draft"
+                        plan_storage.save_plan(plan)
+                        chat.add_message("assistant", f"Plan updated. {reasoning}")
+                    else:
+                        chat.add_message("assistant", reasoning)
+            plan_storage.save_chat_history(chat)
+            return {"messages": [item.model_dump(mode="json") for item in chat.messages]}
+        finally:
+            self._activity.release()
 
     def wait(self, run_id: str, timeout: float | None = None) -> dict[str, Any]:
         record = self._runs[run_id]
@@ -211,10 +312,35 @@ class RunService:
 
     def _execute(self, run_id: str) -> None:
         record = self._runs[run_id]
+        generation = record.generation
+        done = record.done
         record.status = "working"
         self._remember(record)
         if self.pause is not None:
-            self.pause.wait()
+            while not self.pause.is_set():
+                if record.generation != generation or record.control.cancel_requested:
+                    break
+                self.pause.wait(timeout=0.05)
+        if record.generation != generation:
+            done.set()
+            return
+        if record.control.cancel_requested:
+            record.status = "canceled"
+            record.ready = True
+            record.report = {
+                "schema_version": "1",
+                "id": run_id,
+                "verdict": "canceled",
+                "specification": record.specification,
+                "reason_code": "canceled",
+                "reason": "The run was canceled.",
+                "missing": [],
+                "steps": record.steps,
+            }
+            self._write_report(record)
+            self._remember(record)
+            done.set()
+            return
         gui = None
 
         def publish(state: AgentState) -> None:
@@ -244,7 +370,7 @@ class RunService:
 
             deps = GraphDeps(
                 config=self.config,
-                planner=self.planner,
+                planner=self._planner(),
                 gui=gui,
                 cli=CLISubsystem(self.planner, work_dir),
                 coding=coding,
@@ -258,6 +384,7 @@ class RunService:
             )
 
             state = initial_state(record.id, record.specification)
+            state["max_retries"] = self.config.max_retries
             
             # Check if there's an approved plan to use
             plan_storage = PlanStorageManager(self.config.runs_dir)
@@ -329,17 +456,107 @@ class RunService:
             except Exception as e:  # noqa: BLE001
                 print(f"[DEBUG] Failed to close coding subsystem: {e}")
             print(f"[DEBUG] Finally block completed")
+            if record.generation != generation:
+                done.set()
+                return
             if not record.ready:
                 record.ready = True
                 record.status = record.status if record.status in TERMINAL_STATUSES else "failed"
                 self._remember(record)
             print(f"[DEBUG] _execute method completed for {run_id}")
-            record.done.set()
+            done.set()
 
     def _remember(self, record: RunRecord) -> None:
         snap = self.snapshot(record)
         with self._lock:
             record.snapshots.append(snap)
+        self._write_snapshot(record, snap)
+
+    def _write_snapshot(self, record: RunRecord, snap: dict[str, Any]) -> None:
+        path = self.run_dir(record.id) / "snapshot.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(snap, indent=2), encoding="utf-8")
+
+    def _load_saved_runs(self) -> None:
+        if not self.config.runs_dir.is_dir():
+            return
+        found: list[tuple[float, dict[str, Any]]] = []
+        for run_dir in self.config.runs_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            try:
+                data = self._saved_run(run_dir)
+            except Exception:  # noqa: BLE001 - one bad run must not hide the others
+                logger.exception("Could not restore %s", run_dir.name)
+                continue
+            if data is None:
+                continue
+            found.append((run_dir.stat().st_mtime, data))
+        for _, data in sorted(found, key=lambda item: item[0]):
+            self._adopt_saved_run(data)
+
+    def _saved_run(self, run_dir: Path) -> dict[str, Any] | None:
+        snapshot_path = run_dir / "snapshot.json"
+        if snapshot_path.is_file():
+            try:
+                data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Could not read %s", snapshot_path)
+                return None
+            if isinstance(data, dict) and data.get("id"):
+                return data
+        report_path = run_dir / "report.json"
+        if not report_path.is_file():
+            return None
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(report, dict):
+            return None
+        verdict = report.get("verdict") or "error"
+        return {
+            "id": report.get("id") or run_dir.name,
+            "status": status_for_verdict(verdict),
+            "ready": True,
+            "specification": report.get("specification") or "",
+            "steps": report.get("steps") or [],
+            "report": report,
+            "execution_history": [],
+        }
+
+    def _adopt_saved_run(self, data: dict[str, Any]) -> None:
+        status = str(data.get("status") or "submitted")
+        ready = bool(data.get("ready"))
+        report = data.get("report")
+        interrupted = status in {"running", "working"}
+        if interrupted:
+            status = "failed"
+            ready = True
+            report = {
+                "schema_version": "1",
+                "id": data.get("id"),
+                "verdict": "error",
+                "specification": data.get("specification") or "",
+                "reason_code": "engine_error",
+                "reason": "The execution stopped before it finished.",
+                "missing": [],
+                "steps": data.get("steps") or [],
+            }
+        record = RunRecord(
+            id=str(data["id"]),
+            specification=str(data.get("specification") or ""),
+            status=status,
+            ready=ready,
+            steps=list(data.get("steps") or []),
+            report=report if isinstance(report, dict) else None,
+            execution_history=list(data.get("execution_history") or []),
+        )
+        record.done.set()
+        self._runs[record.id] = record
+        if interrupted:
+            self._write_snapshot(record, self.snapshot(record))
+            self._write_report(record)
 
     def _write_report(self, record: RunRecord) -> None:
         if record.report is None:

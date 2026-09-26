@@ -21,7 +21,7 @@ from aqe.config import EngineConfig
 from aqe.state import PlanResult
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
-from aqe.judge import PageJudge, build_judge, judge_stderr
+from aqe.judge import PageJudge, build_judge
 from aqe.llm import Planner
 from aqe.state import (
     ActionResult,
@@ -96,12 +96,10 @@ def _matrix(state: AgentState) -> list[TestStep]:
                             # String operation - treat as CLI command
                             cli_commands.append(op)
                     
-                    if cli_commands:
-                        # Combine CLI commands into action
-                        if cli_commands:
-                            item["action"] = " && ".join(cli_commands)
-                        # For CLI steps, operations should be empty or only GUI actions
-                        item["operations"] = gui_actions if gui_actions else []
+                    if cli_commands and not str(item.get("action") or "").strip():
+                        item["action"] = " && ".join(command for command in cli_commands if command)
+                    if cli_commands or gui_actions:
+                        item["operations"] = gui_actions
                 
                 # Coerce coding operations
                 coding_operations = item.get("coding_operations", [])
@@ -129,10 +127,6 @@ def _matrix(state: AgentState) -> list[TestStep]:
                                 }
                                 if op["action"] in type_to_action:
                                     op["action"] = type_to_action[op["action"]]
-                                else:
-                                    # Unknown action - default to execute_code for coding operations
-                                    logger.warning(f"Unknown coding action '{op['action']}', defaulting to execute_code")
-                                    op["action"] = "execute_code"
                             # Fix common LLM mistakes: rename 'operation' to 'action'
                             if "operation" in op and "action" not in op:
                                 op["action"] = op.pop("operation")
@@ -164,6 +158,17 @@ def _set_status(views: list[StepView], index: int, status: str, **updates: objec
 
 
 def plan_node(state: AgentState, deps: GraphDeps) -> dict:
+    if state.get("test_matrix"):
+        steps = _matrix(state)
+        views = [StepView.from_step(step) for step in steps]
+        return {
+            "phase": "preflight",
+            "test_matrix": [step.model_dump() for step in steps],
+            "step_views": _store_views(views),
+            "current_step": 0,
+            "reason_code": None,
+            "reason": None,
+        }
     try:
         # Check if there's an approved plan in storage
         from aqe.plan_storage import PlanStorageManager
@@ -255,17 +260,21 @@ def preflight_node(state: AgentState, deps: GraphDeps) -> dict:
     return {"phase": "route", "missing": []}
 
 
-def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
-    views = _views(state)
-    _set_status(views, index, "error", assertion_passed=None, summary=message)
-    for later in range(index + 1, len(views)):
-        _set_status(views, later, "skipped", assertion_passed=None)
-    return {
-        "phase": "finish",
-        "reason_code": code,
-        "reason": message,
-        "step_views": _store_views(views),
-    }
+def _retry_limit(state: AgentState, deps: GraphDeps) -> int:
+    value = state.get("max_retries")
+    if isinstance(value, int):
+        return value
+    return deps.config.max_retries
+
+
+def _matrix_dump(matrix: list) -> list[dict]:
+    dumped: list[dict] = []
+    for item in matrix:
+        dumped.append(item if isinstance(item, dict) else item.model_dump())
+    return dumped
+
+
+_EXECUTE_PHASE = {"gui": "execute_gui", "cli": "execute_cli", "coding": "execute_coding"}
 
 
 def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
@@ -281,30 +290,7 @@ def _error_update(state: AgentState, index: int, code: str, message: str) -> dic
     }
 
 
-def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
-    views = _views(state)
-    _set_status(views, index, "error", assertion_passed=None, summary=message)
-    for later in range(index + 1, len(views)):
-        _set_status(views, later, "skipped", assertion_passed=None)
-    return {
-        "phase": "finish",
-        "reason_code": code,
-        "reason": message,
-        "step_views": _store_views(views),
-    }
 
-
-def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
-    views = _views(state)
-    _set_status(views, index, "error", assertion_passed=None, summary=message)
-    for later in range(index + 1, len(views)):
-        _set_status(views, later, "skipped", assertion_passed=None)
-    return {
-        "phase": "finish",
-        "reason_code": code,
-        "reason": message,
-        "step_views": _store_views(views),
-    }
 
 
 def route_node(state: AgentState, deps: GraphDeps) -> dict:
@@ -371,7 +357,7 @@ def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
     attempt_counts = state.get("attempt_counts", {})
     step_key = f"{index}_{kind}"
     current_attempts = attempt_counts.get(step_key, 0)
-    max_retries = state.get("max_retries", 3)
+    max_retries = _retry_limit(state, deps)
     
     try:
         if kind == "gui":
@@ -419,7 +405,8 @@ def _handle_failure(state: AgentState, deps: GraphDeps, index: int, kind: str, s
         
         # Ask LLM to fix the step
         try:
-            fixed_step = deps.planner.fix_step(step, message, current_attempts)
+            payload = step if isinstance(step, dict) else step.model_dump()
+            fixed_step = deps.planner.fix_step(payload, message, current_attempts)
             
             # Check if LLM determined this should not be retried (hard failure)
             if fixed_step.get("_should_not_retry"):
@@ -435,8 +422,8 @@ def _handle_failure(state: AgentState, deps: GraphDeps, index: int, kind: str, s
             _set_status(views, index, "retrying", assertion_passed=None, summary=f"Retry {current_attempts + 1}/{max_retries}: {message}")
             
             return {
-                "phase": kind,  # Retry the same phase
-                "test_matrix": matrix,
+                "phase": _EXECUTE_PHASE.get(kind, "finish"),
+                "test_matrix": _matrix_dump(matrix),
                 "attempt_counts": attempt_counts,
                 "step_views": _store_views(views),
             }
@@ -476,18 +463,6 @@ def execute_coding_node(state: AgentState, deps: GraphDeps) -> dict:
     return _execute(state, deps, "coding")
 
 
-def _error_update(state: AgentState, index: int, code: str, message: str) -> dict:
-    views = _views(state)
-    _set_status(views, index, "error", assertion_passed=None, summary=message)
-    for later in range(index + 1, len(views)):
-        _set_status(views, later, "skipped", assertion_passed=None)
-    return {
-        "phase": "finish",
-        "reason_code": code,
-        "reason": message,
-        "step_views": _store_views(views),
-    }
-
 
 def _structured_check(question: str) -> bool:
     text = question.strip()
@@ -525,47 +500,13 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
     evidence = dict(result.evidence)
     page_source = str(evidence.pop("page_source", "") or "")
 
-    # For CLI steps with verifications, check execution result first before calling judge
-    # If execution failed (non-zero exit code), trigger retry logic
-    if step.interface == "CLI" and (step.assertion or step.verifications) and not result.ok:
-        step_key = f"{index}_cli"
-        attempt_counts = state.get("attempt_counts", {})
-        current_attempts = attempt_counts.get(step_key, 0)
-        max_retries = state.get("max_retries", 3)
-        
-        if current_attempts < max_retries:
-            # Increment attempt count
-            attempt_counts[step_key] = current_attempts + 1
-            
-            # Ask LLM to fix the step
-            try:
-                fixed_step = deps.planner.fix_step(step.model_dump(), result.summary, current_attempts)
-                
-                # Update the matrix with the fixed step
-                matrix[index] = fixed_step
-                
-                # Set status to retrying
-                views = _views(state)
-                _set_status(views, index, "retrying", assertion_passed=None, summary=f"Retry {current_attempts + 1}/{max_retries}: {result.summary}")
-                
-                return {
-                    "phase": "execute_cli",  # Retry the CLI execution
-                    "test_matrix": matrix,
-                    "attempt_counts": attempt_counts,
-                    "step_views": _store_views(views),
-                }
-            except Exception as exc:  # noqa: BLE001
-                # If fixing fails, proceed to normal verification (which will fail)
-                import traceback
-                logger.warning(f"Failed to fix step: {exc}")
-
     # For GUI steps with verifications, check execution result first before calling judge
     # If execution failed, trigger retry logic
     if step.interface == "GUI" and (step.assertion or step.verifications) and not result.ok:
         step_key = f"{index}_gui"
         attempt_counts = state.get("attempt_counts", {})
         current_attempts = attempt_counts.get(step_key, 0)
-        max_retries = state.get("max_retries", 3)
+        max_retries = _retry_limit(state, deps)
         
         if current_attempts < max_retries:
             # Increment attempt count
@@ -584,7 +525,7 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
                 
                 return {
                     "phase": "execute_gui",  # Retry the GUI execution
-                    "test_matrix": matrix,
+                    "test_matrix": _matrix_dump(matrix),
                     "attempt_counts": attempt_counts,
                     "step_views": _store_views(views),
                 }
@@ -592,116 +533,6 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
                 # If fixing fails, proceed to normal verification (which will fail)
                 import traceback
                 logger.warning(f"Failed to fix step: {exc}")
-
-    # Handle CODING steps with assertions
-    # For CODING, if the operation succeeded, the assertion passes
-    # The assertion is more of a description than something to verify against evidence
-    if step.interface == "CODING" and (step.assertion or step.verifications):
-        passed = result.ok
-        judgment_text = result.summary if not passed else None
-        results: list[VerificationResult] = []
-        if step.assertion:
-            results.append(VerificationResult(question=step.assertion, passed=passed, judgment=judgment_text))
-        for verification in step.verifications or []:
-            results.append(VerificationResult(question=verification, passed=passed, judgment=judgment_text))
-        
-        # If CODING operation failed, trigger retry logic
-        if not passed:
-            step_key = f"{index}_coding"
-            attempt_counts = state.get("attempt_counts", {})
-            current_attempts = attempt_counts.get(step_key, 0)
-            max_retries = state.get("max_retries", 3)
-            
-            if current_attempts < max_retries:
-                # Increment attempt count
-                attempt_counts[step_key] = current_attempts + 1
-                
-                # Ask LLM to fix the step
-                try:
-                    fixed_step = deps.planner.fix_step(step.model_dump(), judgment_text, current_attempts)
-                    
-                    # Update the matrix with the fixed step
-                    matrix[index] = fixed_step
-                    
-                    # Set status to retrying
-                    views = _views(state)
-                    _set_status(views, index, "retrying", assertion_passed=None, summary=f"Retry {current_attempts + 1}/{max_retries}: {judgment_text}")
-                    
-                    return {
-                        "phase": "execute_coding",  # Retry the CODING execution
-                        "test_matrix": matrix,
-                        "attempt_counts": attempt_counts,
-                        "step_views": _store_views(views),
-                    }
-                except Exception as exc:  # noqa: BLE001
-                    # If fixing fails, proceed to failure
-                    import traceback
-                    error_msg = f"Failed to fix step: {exc}\n{traceback.format_exc()}"
-                    judgment_text = f"{judgment_text}\n\n{error_msg}"
-        
-        # If CODING operation succeeded, update planner context with coding instructions
-        if passed:
-            coding_instructions = state.get("coding_instructions", [])
-            if coding_instructions:
-                deps.planner.update_coding_context(coding_instructions)
-        
-        views = _views(state)
-        history = list(state.get("execution_history", []))
-        history.append(
-            {
-                "task": step.model_dump(),
-                "result": result.model_dump(),
-                "assertion_passed": passed,
-                "judgment": judgment_text,
-            }
-        )
-        
-        # Reset attempt count on success
-        attempt_counts = state.get("attempt_counts", {})
-        if passed:
-            step_key = f"{index}_{step.interface.lower()}"
-            attempt_counts[step_key] = 0
-        
-        if passed:
-            _set_status(
-                views,
-                index,
-                "passed",
-                assertion_passed=True,
-                judgment=judgment_text,
-                verification_results=results,
-                summary=result.summary,
-                evidence=evidence,
-            )
-            return {
-                "phase": "route",
-                "current_step": index + 1,
-                "step_views": _store_views(views),
-                "execution_history": history,
-                "attempt_counts": attempt_counts,
-                "last_result": result.model_copy(update={"assertion_passed": True}).model_dump(),
-            }
-        else:
-            _set_status(
-                views,
-                index,
-                "failed",
-                assertion_passed=False,
-                judgment=judgment_text,
-                verification_results=results,
-                summary=result.summary,
-                evidence=evidence,
-            )
-            for later in range(index + 1, len(views)):
-                _set_status(views, later, "skipped", assertion_passed=None)
-            reason = result.summary or f"Step {step.step} execution failed"
-            return {
-                "phase": "finish",
-                "reason_code": "assertion_failed",
-                "reason": reason,
-                "step_views": _store_views(views),
-                "execution_history": history,
-            }
 
     # Handle steps without assertions (non-testing steps)
     if not step.assertion and not step.verifications:
@@ -716,7 +547,7 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
                 step_key = f"{index}_cli"
                 attempt_counts = state.get("attempt_counts", {})
                 current_attempts = attempt_counts.get(step_key, 0)
-                max_retries = state.get("max_retries", 3)
+                max_retries = _retry_limit(state, deps)
                 
                 if current_attempts < max_retries:
                     # Increment attempt count
@@ -735,7 +566,7 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
                         
                         return {
                             "phase": "execute_cli",  # Retry the CLI execution
-                            "test_matrix": matrix,
+                            "test_matrix": _matrix_dump(matrix),
                             "attempt_counts": attempt_counts,
                             "step_views": _store_views(views),
                         }
@@ -829,100 +660,20 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
             if part.strip()
         )
         
-        # Check if this is a file-based verification (mentions file, log, etc.)
-        is_file_check = any(keyword in question.lower() for keyword in ["file", "log", "exists", "contains"])
-        # Check if this is a port-based verification (mentions port, listening, lsof)
-        is_port_check = any(keyword in question.lower() for keyword in ["port", "listening", "lsof", "socket"])
-        
-        logger.info(f"is_file_check: {is_file_check}, is_port_check: {is_port_check}")
-        
         if step.interface == "CLI":
-            # For CLI steps, don't use PageJudge - use direct evaluation
-            if _structured_check(question):
-                ok = evaluate_assertion(question, evidence)
-                results.append(VerificationResult(question=question, passed=ok))
-                passed = passed and ok
-            elif is_port_check:
-                # Port-based checks: actually run lsof to check the port
-                # Extract port number from the question
-                import re
-                import subprocess
-                port_match = re.search(r'port\s*(\d+)', question.lower())
-                if port_match:
-                    port = port_match.group(1)
-                    # Run lsof to check the port
-                    try:
-                        result = subprocess.run(
-                            ["lsof", f"-i:{port}", "-sTCP:LISTEN"],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                            check=False
-                        )
-                        port_output = result.stdout or ""
-                        if f":{port}" in port_output and "LISTEN" in port_output:
-                            judgment = f"Port {port} is listening"
-                            port_passed = True
-                        else:
-                            judgment = f"Port {port} is not listening"
-                            port_passed = False
-                    except Exception as exc:  # noqa: BLE001
-                        judgment = f"Failed to check port {port}: {exc}"
-                        port_passed = False
-                else:
-                    judgment = "Could not extract port number from verification"
-                    port_passed = False
-                results.append(VerificationResult(question=question, passed=port_passed, judgment=judgment))
-                passed = passed and port_passed
-            elif is_file_check:
-                # File-based checks should use LLM judge to properly detect errors
-                # Try to read the file content if it's mentioned in the verification
-                file_content = output
-                import re
-                # Try to extract file path from the verification
-                file_match = re.search(r'(\S+\.(?:log|txt|json|py|yaml|yml|conf|cfg))', question, re.IGNORECASE)
-                if file_match:
-                    file_path = file_match.group(1)
-                    try:
-                        # Try to read the file from the work directory
-                        if deps.work_dir:
-                            full_path = deps.work_dir / file_path
-                            if full_path.exists():
-                                file_content = full_path.read_text()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(f"Failed to read file {file_path}: {exc}")
-                judged = _judged_or_unreadable(deps, question, file_content)
-                results.append(
-                    VerificationResult(question=question, passed=judged.passed, judgment=judged.judgment)
-                )
-                judgments.append(judged.judgment)
-                passed = passed and judged.passed
-            else:
-                # For non-structured CLI assertions, check if command succeeded
-                # If exit code is non-zero, it's an error
-                stderr = str(evidence.get("stderr") or "")
-                command_passed = result.ok
-                if not result.ok:
-                    judgment = "Command failed with exit code"
-                # Use LLM to judge if stderr represents an actual error when exit code is 0
-                elif stderr.strip():
-                    if deps.chat_model is None:
-                        from aqe.chat import get_chat_model
-                        deps.chat_model = get_chat_model()
-                    is_error, explanation = judge_stderr(deps.chat_model, stderr, 0)
-                    if is_error:
-                        command_passed = False
-                        judgment = f"Command failed with error: {explanation}"
-                    else:
-                        judgment = f"Command succeeded with warnings: {explanation}"
-                else:
-                    judgment = "Command succeeded"
-                results.append(VerificationResult(
-                    question=question,
-                    passed=command_passed,
-                    judgment=judgment
-                ))
-                passed = passed and command_passed
+            judged = _judged_or_unreadable(deps, question, _command_text(evidence))
+            results.append(
+                VerificationResult(question=question, passed=judged.passed, judgment=judged.judgment)
+            )
+            judgments.append(judged.judgment)
+            passed = passed and judged.passed
+        elif step.interface == "CODING":
+            judged = _judged_or_unreadable(deps, question, result.summary or output)
+            results.append(
+                VerificationResult(question=question, passed=judged.passed, judgment=judged.judgment)
+            )
+            judgments.append(judged.judgment)
+            passed = passed and judged.passed
         elif page_source.strip():
             judged = _judged_or_unreadable(deps, question, page_source)
             results.append(
@@ -973,7 +724,7 @@ def validate_node(state: AgentState, deps: GraphDeps) -> dict:
     attempts = dict(state.get("attempt_counts", {}))
     key = str(index)
     attempts[key] = attempts.get(key, 0) + 1
-    if attempts[key] <= deps.config.max_retries:
+    if attempts[key] <= _retry_limit(state, deps):
         _set_status(
             views,
             index,
@@ -1097,11 +848,13 @@ def build_graph(deps: GraphDeps, publish: Callable[[AgentState], None] | None = 
                 print(f"[DEBUG] Node {fn.__name__} failed with error: {e}")
                 import traceback
                 traceback.print_exc()
-                
-                # Get current step index
-                matrix = _matrix(state)
+
                 index = state.get("current_step", 0)
-                views = _views(state)
+                try:
+                    views = _views(state)
+                except Exception:
+                    logger.exception("Could not read step views after %s failed", fn.__name__)
+                    views = []
                 
                 # Mark current step as error
                 if index < len(views):
@@ -1111,13 +864,32 @@ def build_graph(deps: GraphDeps, publish: Callable[[AgentState], None] | None = 
                 for later in range(index + 1, len(views)):
                     _set_status(views, later, "skipped", assertion_passed=None)
                 
-                error_update = {
-                    "phase": "finish",
-                    "reason_code": "engine_error",
-                    "reason": str(e),
-                    "step_views": _store_views(views),
-                }
-                
+                stored_views = _store_views(views)
+                if fn.__name__ == "finish_node":
+                    report = TestReport(
+                        id=state.get("run_id", ""),
+                        verdict="error",
+                        specification=state.get("specification") or "",
+                        reason_code="engine_error",
+                        reason=str(e),
+                        missing=list(state.get("missing") or []),
+                        steps=views,
+                    )
+                    error_update = {
+                        "phase": "done",
+                        "reason_code": "engine_error",
+                        "reason": str(e),
+                        "report": report.model_dump(),
+                        "step_views": stored_views,
+                    }
+                else:
+                    error_update = {
+                        "phase": "finish",
+                        "reason_code": "engine_error",
+                        "reason": str(e),
+                        "step_views": stored_views,
+                    }
+
                 if publish is not None:
                     publish({**state, **error_update})
                 return error_update
@@ -1151,7 +923,6 @@ def initial_state(run_id: str, specification: str) -> AgentState:
         "phase": "plan",
         "step_views": [],
         "last_result": None,
-        "max_retries": 3,
         "report": None,
         "reason_code": None,
         "reason": None,

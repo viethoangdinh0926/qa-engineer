@@ -9,6 +9,14 @@ class HarnessError(Exception):
         super().__init__(message)
 
 
+class AgentBusyError(Exception):
+    """The agent is already turning a request or a question into a plan."""
+
+    def __init__(self, message: str = "The agent is still processing a request.") -> None:
+        self.message = message
+        super().__init__(message)
+
+
 class SpecValidationError(Exception):
     """The request body cannot become a run."""
 

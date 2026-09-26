@@ -116,6 +116,18 @@ body {
   background: #e3f2fd;
 }
 
+.chat-message.processing {
+  color: #5c6b7a;
+  font-style: italic;
+  background: transparent;
+}
+
+body.busy button,
+body.busy textarea {
+  pointer-events: none;
+  opacity: 0.65;
+}
+
 .chat-role {
   font-weight: 600;
   font-size: 0.85rem;

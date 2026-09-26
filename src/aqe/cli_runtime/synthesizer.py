@@ -275,9 +275,8 @@ class CLISubsystem:
         intent = re.sub(r'(?<![&|;])\.\s+(?=\S)', ' && ', intent)
         
         script = self.planner.script_for(intent)
-        # work_dir is already set to runs/<run_id>/work by the service
-        # Use it directly without creating nested paths
-        work_dir = self.work_dir
+        # An absolute directory keeps script.py from being resolved against itself.
+        work_dir = self.work_dir if self.work_dir.is_absolute() else self.work_dir.resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # Check if the script is a direct CLI command (not Python code)

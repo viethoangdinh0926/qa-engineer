@@ -10,6 +10,7 @@ const state = {
   plannerChatMessages: [],
   currentPlan: null,
   currentRunId: null,
+  busy: false,
 };
 
 function statusClass(value) {
@@ -91,20 +92,21 @@ function renderShell() {
   const form = document.createElement("form");
   form.className = "card";
   const heading = document.createElement("h2");
-  heading.textContent = "New run";
+  heading.textContent = "New test";
   const label = document.createElement("label");
   label.className = "field";
   label.htmlFor = "specification";
-  label.textContent = "Specification";
+  label.textContent = "Testing request";
   const area = document.createElement("textarea");
   area.id = "specification";
   area.name = "specification";
-  area.placeholder = "Paste a test specification";
+  area.placeholder = "Describe what you want to test";
   const row = document.createElement("div");
   row.className = "row";
   const button = document.createElement("button");
   button.type = "submit";
-  button.textContent = "Run specification";
+  button.id = "submit-spec";
+  button.textContent = "Create plan";
   row.append(button);
   const error = document.createElement("p");
   error.id = "form-error";
@@ -151,6 +153,24 @@ function paintChrome() {
   const notice = document.querySelector("#notice");
   notice.hidden = !state.notice;
   notice.textContent = state.notice;
+}
+
+function setBusy(busy) {
+  state.busy = busy;
+  document.body.classList.toggle("busy", busy);
+  const chatBox = document.querySelector("#chat-message");
+  const send = document.querySelector(".chat-input button");
+  if (chatBox) {
+    chatBox.disabled = busy;
+  }
+  if (send) {
+    send.disabled = busy;
+  }
+  renderChatMessages();
+}
+
+function executing(run) {
+  return Boolean(run && !run.ready && (run.status === "running" || run.status === "working"));
 }
 
 function stepDetails(step, detailed) {
@@ -359,12 +379,45 @@ function upsertRun(snapshot) {
     state.runs[index] = snapshot;
   }
   paintRuns();
+  if (snapshot.id === state.currentRunId && state.currentPlan) {
+    renderPlan();
+  }
 }
 
 function toggleRun(id) {
-  state.expandedId = state.expandedId === id ? null : id;
-  const path = state.expandedId ? `/runs/${state.expandedId}` : "/";
-  window.history.pushState({}, "", path);
+  if (state.busy) {
+    return;
+  }
+  if (state.expandedId === id) {
+    state.expandedId = null;
+    window.history.pushState({}, "", "/");
+    paintRuns();
+    return;
+  }
+  openRun(id);
+}
+
+async function openRun(id) {
+  state.expandedId = id;
+  state.currentRunId = id;
+  state.currentPlan = null;
+  state.plannerChatMessages = [];
+  state.plannerChatOpen = true;
+  window.history.pushState({}, "", `/runs/${id}`);
+  const sidebar = document.querySelector("#planner-sidebar");
+  if (sidebar) {
+    sidebar.classList.add("open");
+  }
+  const response = await fetch(`/v1/runs/${id}`);
+  if (response.ok) {
+    upsertRun(await response.json());
+  }
+  await loadPlan(id);
+  await loadChatHistory(id);
+  const run = state.runs.find((item) => item.id === id);
+  if (executing(run)) {
+    watchRun(id);
+  }
   paintRuns();
 }
 
@@ -395,8 +448,18 @@ function watchRun(id) {
 }
 
 async function submitSpecification(area, button) {
+  if (state.busy) {
+    return;
+  }
   state.formError = "";
+  state.notice = "";
   paintChrome();
+  const sidebar = document.querySelector("#planner-sidebar");
+  if (sidebar) {
+    sidebar.classList.add("open");
+    state.plannerChatOpen = true;
+  }
+  setBusy(true);
   button.disabled = true;
   try {
     const response = await fetch("/v1/runs", {
@@ -411,30 +474,20 @@ async function submitSpecification(area, button) {
       return;
     }
     area.value = "";
-    state.notice = `Started run ${body.id}`;
-    state.expandedId = body.id;
-    state.currentRunId = body.id;
-    window.history.pushState({}, "", `/runs/${body.id}`);
-    upsertRun(body);
-    watchRun(body.id);
-    
-    // Load plan and chat history
-    loadPlan(body.id);
-    loadChatHistory(body.id);
-    
+    state.notice = `Plan ready for ${body.id}`;
     paintChrome();
+    await openRun(body.id);
   } finally {
     button.disabled = false;
+    setBusy(false);
   }
 }
 
 async function loadPlan(runId) {
   try {
     const response = await fetch(`/v1/runs/${runId}/plan`);
-    if (response.ok) {
-      state.currentPlan = await response.json();
-      renderPlan();
-    }
+    state.currentPlan = response.ok ? await response.json() : null;
+    renderPlan();
   } catch (error) {
     console.error("Failed to load plan:", error);
   }
@@ -456,30 +509,33 @@ async function loadChatHistory(runId) {
 async function sendPlannerMessage() {
   const textarea = document.getElementById("chat-message");
   const message = textarea.value.trim();
-  if (!message || !state.currentRunId) return;
-  
+  if (!message || !state.currentRunId || state.busy) return;
+
   textarea.value = "";
-  
-  // Add user message to UI
   state.plannerChatMessages.push({ role: "user", content: message });
-  renderChatMessages();
-  
+  setBusy(true);
+
   try {
     const response = await fetch(`/v1/runs/${state.currentRunId}/planner/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message }),
     });
+    const data = await response.json();
     if (response.ok) {
-      const data = await response.json();
       state.plannerChatMessages = data.messages || [];
-      renderChatMessages();
-      
-      // Reload plan after refinement
-      loadPlan(state.currentRunId);
+      await loadPlan(state.currentRunId);
+    } else {
+      state.notice = data.error || "The agent could not answer.";
+      paintChrome();
+      await loadChatHistory(state.currentRunId);
     }
   } catch (error) {
     console.error("Failed to send message:", error);
+    state.notice = "The agent could not answer.";
+    paintChrome();
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -501,11 +557,24 @@ function renderChatMessages() {
     container.appendChild(messageDiv);
   });
   
+  if (state.busy) {
+    const pending = document.createElement("div");
+    pending.className = "chat-message processing";
+    pending.textContent = "processing…";
+    container.appendChild(pending);
+  }
+
   container.scrollTop = container.scrollHeight;
 }
 
 function renderPlan() {
-  if (!state.currentPlan) return;
+  if (!state.currentPlan) {
+    const existing = document.getElementById("plan-section");
+    if (existing) {
+      existing.replaceChildren();
+    }
+    return;
+  }
   
   // Create plan display section
   let planSection = document.getElementById("plan-section");
@@ -540,10 +609,10 @@ function renderPlan() {
     phaseDiv.innerHTML = `
       <h4>Phase ${phase.phase}: ${phase.name}</h4>
       <p><strong>Interface:</strong> ${phase.interface}</p>
-      <p><strong>Depends on:</strong> ${phase.depends_on.join(", ") || "None"}</p>
+      <p><strong>Depends on:</strong> ${(phase.depends_on || []).join(", ") || "None"}</p>
       <p><strong>Verifications:</strong></p>
       <ul>
-        ${phase.verifications.map(v => `<li>${v}</li>`).join("")}
+        ${(phase.verifications || []).map(v => `<li>${v}</li>`).join("")}
       </ul>
     `;
     planContent.appendChild(phaseDiv);
@@ -553,28 +622,24 @@ function renderPlan() {
   const actionsDiv = document.createElement("div");
   actionsDiv.className = "plan-actions";
   
-  if (state.currentPlan.status === "draft") {
-    const approveButton = document.createElement("button");
-    approveButton.textContent = "Approve Plan";
-    approveButton.className = "approve-btn";
-    approveButton.addEventListener("click", () => approvePlan());
-    
-    const rejectButton = document.createElement("button");
-    rejectButton.textContent = "Reject Plan";
-    rejectButton.className = "reject-btn";
-    rejectButton.addEventListener("click", () => rejectPlan());
-    
-    actionsDiv.append(approveButton, rejectButton);
-  } else if (state.currentPlan.status === "approved") {
-    // Add re-run button if plan is approved but not currently running
-    const isRunning = state.currentRun && state.currentRun.status === "running";
-    if (!isRunning) {
-      const rerunButton = document.createElement("button");
-      rerunButton.textContent = "Re-run Plan";
-      rerunButton.className = "approve-btn";
-      rerunButton.addEventListener("click", () => rerunPlan());
-      actionsDiv.appendChild(rerunButton);
+  const run = state.runs.find((item) => item.id === state.currentRunId);
+  if (executing(run)) {
+    const cancelButton = document.createElement("button");
+    cancelButton.textContent = "Cancel execution";
+    cancelButton.className = "reject-btn";
+    cancelButton.addEventListener("click", () => cancelExecution());
+    actionsDiv.appendChild(cancelButton);
+  } else if (state.currentPlan.status !== "rejected" && (state.currentPlan.phases || []).length) {
+    const runButton = document.createElement("button");
+    runButton.className = "approve-btn";
+    if (state.currentPlan.status === "approved") {
+      runButton.textContent = "Run plan";
+      runButton.addEventListener("click", () => rerunPlan());
+    } else {
+      runButton.textContent = "Approve and run";
+      runButton.addEventListener("click", () => approvePlan());
     }
+    actionsDiv.appendChild(runButton);
   }
   
   const downloadButton = document.createElement("button");
@@ -588,38 +653,71 @@ function renderPlan() {
 }
 
 async function approvePlan() {
-  if (!state.currentRunId) return;
-  
+  if (!state.currentRunId || state.busy) return;
+  setBusy(true);
   try {
     const response = await fetch(`/v1/runs/${state.currentRunId}/plan/approve`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ user: "user" }),
     });
-    if (response.ok) {
-      state.currentPlan = await response.json();
-      renderPlan();
-      // Execution is started automatically by the approve endpoint
+    const body = await response.json();
+    if (!response.ok) {
+      state.notice = body.error || "Could not start the run.";
+      paintChrome();
+      return;
     }
+    state.currentPlan = body;
+    await refreshSelectedRun();
+    watchRun(state.currentRunId);
+    renderPlan();
   } catch (error) {
     console.error("Failed to approve plan:", error);
+  } finally {
+    setBusy(false);
   }
 }
 
-async function rerunPlan() {
+async function refreshSelectedRun() {
   if (!state.currentRunId) return;
-  
+  const response = await fetch(`/v1/runs/${state.currentRunId}`);
+  if (response.ok) {
+    upsertRun(await response.json());
+  }
+}
+
+async function cancelExecution() {
+  if (!state.currentRunId || state.busy) return;
+  const response = await fetch(`/v1/runs/${state.currentRunId}:cancel`, { method: "POST" });
+  if (!response.ok) {
+    const body = await response.json();
+    state.notice = body.error || "Could not cancel the run.";
+    paintChrome();
+    return;
+  }
+  upsertRun(await response.json());
+  watchRun(state.currentRunId);
+  renderPlan();
+}
+
+async function rerunPlan() {
+  if (!state.currentRunId || state.busy) return;
+  setBusy(true);
   try {
     const response = await fetch(`/v1/runs/${state.currentRunId}:start`, { method: "POST" });
-    if (response.ok) {
-      console.log("Re-run started");
-      // Ensure the run is being watched for updates
-      watchRun(state.currentRunId);
-      // Refresh the plan to update the button state
-      renderPlan();
+    const body = await response.json();
+    if (!response.ok) {
+      state.notice = body.error || "Could not start the run.";
+      paintChrome();
+      return;
     }
+    upsertRun(body);
+    watchRun(state.currentRunId);
+    renderPlan();
   } catch (error) {
     console.error("Failed to re-run plan:", error);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -672,18 +770,23 @@ async function boot() {
   state.runs = body.runs || [];
   const match = window.location.pathname.match(/^\/runs\/([^/]+)$/);
   if (match) {
-    state.expandedId = decodeURIComponent(match[1]);
+    await openRun(decodeURIComponent(match[1]));
+  } else {
+    paintRuns();
   }
-  paintRuns();
   for (const run of state.runs) {
-    if (!run.ready) {
+    if (executing(run)) {
       watchRun(run.id);
     }
   }
   window.addEventListener("popstate", () => {
     const next = window.location.pathname.match(/^\/runs\/([^/]+)$/);
-    state.expandedId = next ? decodeURIComponent(next[1]) : null;
-    paintRuns();
+    if (next) {
+      openRun(decodeURIComponent(next[1]));
+    } else {
+      state.expandedId = null;
+      paintRuns();
+    }
   });
 }
 

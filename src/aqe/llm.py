@@ -108,34 +108,28 @@ class Planner(Protocol):
         """Refine the plan based on user feedback. Returns (phases, steps, reasoning)."""
 
 
+_AGENT_CAPABILITIES = (
+    "The agent can use two capabilities: a web browser (open a page, type into a field, click a button, press a key) "
+    "and host CLI tools (shell commands). "
+    "Desktop input and a coding agent are not available. "
+    "Every phase must be executable with the browser or a CLI command. "
+    "If the request cannot be tested with those capabilities, set accepted to false and explain that mismatch in reason. "
+)
+
 _PLAN_SYSTEM = (
-    "You are the planner, not the executor. Another system will run the phases you write: "
-    "GUI phases in a browser, CLI phases in the host environment, CODING phases through a Pi coding agent. "
+    _AGENT_CAPABILITIES
+    + "You are the planner, not the executor. Another system will run the phases you write: "
+    "GUI phases in the browser, and CLI phases with host CLI tools. "
     "Do not reject a request because you cannot click, browse, read files, or write code yourself. "
     "Turn the testing request into one linear pipeline of testing phases. "
     "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Each phase is a chain of operations followed by the verifications of those operations. "
     "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
-    "interface (GUI, CLI, or CODING), gui_driver (browser, desktop, or null), operations, coding_operations, and verifications. "
+    "interface (GUI or CLI), gui_driver (browser or null), operations, and verifications. "
     "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
     "CLI operations are strings. "
-    "CODING operations are objects with action create_file, update_file, review_code, or execute_code, "
-    "plus file_path, content, and description when needed. "
-    "CODING operations ARE valid test operations. They are not 'development activities' to be rejected. "
-    "Creating files, writing code, and setting up test fixtures are legitimate testing operations. "
-    "IMPORTANT: When a phase has interface CODING, you MUST include coding_operations with the actual file operations. "
-    "Do not create a CODING phase with only verifications and no coding_operations. "
-    "Example: 'Create a file test.py with a hello world function' becomes a CODING phase with "
-    "coding_operations: [{'action': 'create_file', 'file_path': 'test.py', 'content': 'def hello(): print(\"world\")'}]. "
-    "IMPORTANT: Be consistent throughout your plan. If you instruct the coding agent to create a service on a specific port "
-    "(e.g., port 5000), you must use that same port in all subsequent test steps that interact with the service. "
-    "If you create a file with a specific name or structure, reference it consistently in later steps. "
-    "The coding agent will execute your instructions exactly as you write them, so be precise and consistent. "
-    "For example, if you write 'Create a Flask service listening on port 5000', then later you must write "
-    "'Test the service at http://localhost:5000', not port 8000 or any other port. "
-    "Keep track of the details you specify in coding steps and use them consistently in CLI/GUI test steps. "
     "GUI verifications are questions about the page after the operations. "
-    "CLI and CODING verifications are questions about the command output or file state. "
+    "CLI verifications are questions about the command output. "
     "Write every verification as one or two complete sentences. Be specific and verbose. "
     "Keep the original meaning of the user's check. Do not add a condition they did not ask for, and do not drop one they did. "
     "Do not shorten a check into contains:, json:, or status:. "
@@ -159,12 +153,7 @@ _PLAN_SYSTEM = (
     "Or check the log file: 'The service.log file exists and contains no error messages, indicating the service started without crashing.' "
     "Or check if the service is listening: 'The service is listening on the expected port, indicating it started successfully.' "
     "This ensures that service startup failures or crashes are detected. "
-    "For coding operations, detect requests like 'create a file', 'update code', 'review the code', 'execute the script'. "
-    "Some phases may be setup or preparation steps without explicit verifications. "
-    "These are still important - if they fail, the entire test fails. "
-    "If all phases have no verifications, the test passes if all operations succeed. "
-    "For setup steps like 'Create a directory' or 'Install dependencies', include the operation but no verification. "
-    "The system will still check that the operation succeeded. "
+    "Every phase needs at least one verification. "
     "Put a phase that needs another phase's result after that phase, and list it in depends_on. "
     "One page visit is one GUI phase. Navigation, typing, and the click are that phase's operations. "
     "The page check is a verification on that same phase, not a later phase. "
@@ -185,7 +174,9 @@ _PLAN_SYSTEM = (
 )
 
 _REPAIR_SYSTEM = (
-    "Revise the testing plan. Reply with one JSON object only, with keys accepted, reason, and phases. "
+    _AGENT_CAPABILITIES
+    + "Revise the testing plan so every phase is executable with the browser or a CLI command. "
+    "Reply with one JSON object only, with keys accepted, reason, and phases. "
     "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, coding_operations, and verifications. "
     "verifications must be strings. "
     "Every check the request asks for must appear as a verification written as one or two complete sentences. "
@@ -277,7 +268,8 @@ _FIX_STEP_SYSTEM = (
 )
 
 _REFINE_PLAN_SYSTEM = (
-    "You are a test planning assistant. Users may ask you questions about the current plan or request changes to it.\n\n"
+    _AGENT_CAPABILITIES
+    + "You are a test planning assistant. Users may ask you questions about the current plan or request changes to it.\n\n"
     "If the user asks a question (e.g., 'Why did you include this step?', 'Explain phase 2', 'What does this verification check?'), "
     "provide a clear, helpful answer about the current plan. Return JSON with:\n"
     "{\n"
@@ -292,7 +284,7 @@ _REFINE_PLAN_SYSTEM = (
     "    {\n"
     "      \"phase\": integer (phase number),\n"
     "      \"name\": string (phase name),\n"
-    "      \"interface\": \"GUI\", \"CLI\", or \"CODING\",\n"
+    "      \"interface\": \"GUI\" or \"CLI\",\n"
     "      \"gui_driver\": \"browser\", \"desktop\", or null,\n"
     "      \"depends_on\": [list of phase numbers],\n"
     "      \"operations\": [\n"
@@ -317,7 +309,7 @@ _REFINE_PLAN_SYSTEM = (
     "  \"steps\": [\n"
     "    {\n"
     "      \"step\": integer (step number),\n"
-    "      \"interface\": \"GUI\", \"CLI\", or \"CODING\",\n"
+    "      \"interface\": \"GUI\" or \"CLI\",\n"
     "      \"gui_driver\": \"browser\", \"desktop\", or null,\n"
     "      \"action\": string (action description),\n"
     "      \"assertion\": string (assertion),\n"
@@ -343,8 +335,8 @@ _REFINE_PLAN_SYSTEM = (
     "  \"reasoning\": string (explanation of changes)\n"
     "}\n\n"
     "CRITICAL: For plan updates, use 'phase' (not 'id') for the phase number. Always include 'interface' field. "
-    "operations must be a list of objects, not strings. coding_operations must be a list of objects, not strings. "
-    "Each coding operation must have action, file_path, content, and description fields."
+    "GUI operations are objects. CLI operations are command strings. "
+    "Do not add a coding phase or a desktop phase."
 )
 
 _NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat", "pip", "pip3", "npm", "npm install", "apt", "apt-get", "yum", "dnf"})
@@ -380,12 +372,13 @@ def _coerce_steps(steps: object) -> list[dict]:
         item = dict(step)
         number = item.get("step")
         action = item.get("action")
+        described_action = action if isinstance(action, dict) else None
         if isinstance(number, str) and number.isdigit():
             item["step"] = int(number)
         elif not isinstance(number, int):
-            if isinstance(number, str) and not isinstance(action, str):
-                item["action"] = number
             item["step"] = index
+            if isinstance(number, str) and described_action is not None:
+                item["action"] = number
         
         # Handle operations field
         operations = item.get("operations")
@@ -424,8 +417,9 @@ def _coerce_steps(steps: object) -> list[dict]:
                 logger.info(f"Converted CLI dict operations to action for step {index}")
         
         # For GUI steps, operations should be GUIAction objects
-        if interface == "GUI" and isinstance(action, dict):
-            item["operations"] = item.get("operations") or _operations_from_action(action)
+        if interface == "GUI" and (isinstance(action, dict) or described_action is not None):
+            source = described_action if described_action is not None else action
+            item["operations"] = item.get("operations") or _operations_from_action(source)
             if not isinstance(item.get("action"), str):
                 item["action"] = "Perform the described action."
         
@@ -494,7 +488,7 @@ def _missing_operations(steps: list[TestStep]) -> str | None:
             return f"step {step.step} has no GUI operations"
         if step.interface == "CODING" and not step.coding_operations:
             return f"step {step.step} has no coding operations"
-        if step.interface == "CLI" and not step.operation_notes:
+        if step.interface == "CLI" and not step.operation_notes and not step.action.strip():
             return f"step {step.step} has no CLI operations"
     return None
 
@@ -925,14 +919,21 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
                 f"{label} has no operations. "
                 f"A phase has to carry out a chain of operations to be actionable."
             )
-        # CODING phases must have coding_operations
-        if phase.interface == "CODING" and not phase.coding_operations:
+        if phase.interface == "CODING":
             problems.append(
-                f"{label} has interface CODING but no coding_operations. "
-                f"A CODING phase must include coding_operations (create_file, update_file, review_code, execute_code)."
+                f"{label} is not executable. A coding agent is not available. "
+                "Use the browser or a CLI command."
             )
-        # Phases without verifications are now allowed (setup/preparation steps)
-        # The test passes if all operations succeed, even without assertions
+        if phase.interface == "GUI" and phase.gui_driver == "desktop":
+            problems.append(
+                f"{label} is not executable. Desktop input is not available. "
+                "Use the browser or a CLI command."
+            )
+        if not phase.verifications:
+            problems.append(
+                f"{label} has no verifications. "
+                "Each phase needs a check that says what those operations must produce."
+            )
     if not problems:
         return None
     return "\n".join(problems)
@@ -1096,7 +1097,12 @@ def _parse_operations(content: str) -> dict[int, list]:
     payload = _json_object(content)
     rows = payload.get("operations") or payload.get("steps") or []
     parsed: dict[int, list] = {}
-    if rows and isinstance(rows, list) and rows and isinstance(rows[0], dict) and "action" in rows[0]:
+    if (
+        rows
+        and isinstance(rows, list)
+        and isinstance(rows[0], dict)
+        and rows[0].get("action") in {"goto", "type", "click", "press"}
+    ):
         return {1: rows}
     for item in rows:
         if not isinstance(item, dict) or "step" not in item:
@@ -1304,7 +1310,7 @@ class ChatModelPlanner:
         except Exception:  # noqa: BLE001 - keep the finding when the explanation call fails
             return text
         explained = _strip_fence(explained).strip()
-        if len(explained) < 80:
+        if len(explained) < 80 or explained.startswith("{") or explained.startswith("["):
             return text
         return explained
 
@@ -1338,73 +1344,15 @@ class ChatModelPlanner:
         return filled
 
     def script_for(self, intent: str) -> str:
-        # Use LLM to determine if we should use direct CLI command or Python script
-        # based on the testing environment and command type
+        if "Assertion: json:" in intent or "json:" in intent:
+            return (
+                "import json\n"
+                "from pathlib import Path\n"
+                "files = sorted(Path('/evidence').glob('*.json'))\n"
+                "print(files[0].read_text(encoding='utf-8') if files else '{}')\n"
+            )
         command = command_from_intent(intent)
         if command:
-            # Use LLM to decide execution strategy
-            try:
-                decision_prompt = "Given this test command: " + command + """
-
-Analyze the command and determine the best execution strategy:
-1. Should this be executed as a direct CLI command (without Python wrapper)?
-2. Or should it be wrapped in a Python script?
-
-Consider:
-- If the command is simple (curl, wget, ls, cat, grep, jq, sed, awk, etc.) → use direct CLI
-- If the command needs to access localhost/host resources → use direct CLI on host
-- If the command uses common CLI tools that are likely available → use direct CLI
-- If the command needs complex logic, loops, or Python features → use Python script
-- If the command references files created by CODING steps → use Python script with /run directory
-- If the command uses shell variables or complex shell syntax → use direct CLI
-- IMPORTANT: Always prefer CLI tools over Python scripts when possible
-- IMPORTANT: Never use environment variables ($VAR) in commands. Use concrete values instead.
-- If unsure, use Python script for better error handling
-
-Return your answer in this exact JSON format:
-{{"use_direct_cli": true_or_false, "reason": "explanation"}}"""
-
-                decision = self.model.invoke([
-                    SystemMessage(content="You are a test execution strategist. Return valid JSON only."),
-                    HumanMessage(content=decision_prompt)
-                ])
-                
-                import json
-                decision_text = decision.content if hasattr(decision, 'content') else str(decision)
-                result = json.loads(decision_text.strip())
-                
-                use_direct_cli = result.get("use_direct_cli", False)
-                
-                if use_direct_cli:
-                    # Return the raw command for direct CLI execution
-                    return command
-            except Exception as exc:  # noqa: BLE001
-                # Fall back to Python script on any error
-                logger.warning(f"Failed to determine execution strategy: {exc}")
-            
-            # Original logic for Python script generation
-            if "Assertion: json:" in intent or "json:" in intent:
-                return (
-                    "import json\n"
-                    "from pathlib import Path\n"
-                    "files = sorted(Path('/evidence').glob('*.json'))\n"
-                    "print(files[0].read_text(encoding='utf-8') if files else '{}')\n"
-                )
-            # For commands that reference files, prepend /run to make CODING files accessible
-            # This handles cases like "python app.py" where app.py was created by a CODING step
-            if command and any(ext in command for ext in ['.py', '.txt', '.json', '.md', '.sh']):
-                # Change working directory to /run for file operations
-                return (
-                    "import os\n"
-                    "import subprocess\n"
-                    "import shlex\n"
-                    "os.chdir('/run')\n"
-                    "result = subprocess.run(shlex.split(" + repr(command) + "), capture_output=True, text=True)\n"
-                    "print(result.stdout)\n"
-                    "if result.stderr:\n"
-                    "    print(result.stderr, file=__import__('sys').stderr)\n"
-                    "exit(result.returncode)\n"
-                )
             return command_script(command)
         message = self.model.invoke(
             [
@@ -1455,6 +1403,17 @@ Return your answer in this exact JSON format:
         """Update the planner's context with coding instructions from previous steps."""
         self.coding_instructions = coding_instructions
 
+    def _phases_from_model(self, raw_phases: list) -> tuple[list[TestPhase], list[TestStep], str | None]:
+        phases, problem = _coerce_phases(raw_phases)
+        if not problem:
+            problem = _validate_phases(phases)
+        if problem:
+            return [], [], problem
+        ordered, order_problem = order_phases(phases)
+        if order_problem:
+            return [], [], order_problem
+        return ordered, [_phase_to_step(phase) for phase in ordered], None
+
     def refine_plan(self, current_phases: list[TestPhase], current_steps: list[TestStep],
                    user_feedback: str, chat_history: list[dict]) -> tuple[list[TestPhase], list[TestStep], str]:
         """Refine the plan based on user feedback. Returns (phases, steps, reasoning)."""
@@ -1497,18 +1456,30 @@ Return your answer in this exact JSON format:
             if response.get("type") == "answer":
                 # User asked a question, return the answer without changing the plan
                 return current_phases, current_steps, response.get("answer", "Answer provided.")
-            elif response.get("type") == "plan_update":
-                # User requested changes, parse and return the updated plan
-                phases = [TestPhase.model_validate(p) for p in response.get("phases", [])]
-                steps = [TestStep.model_validate(s) for s in response.get("steps", [])]
-                reasoning = response.get("reasoning", "Plan refined based on user feedback.")
+            elif response.get("type") == "plan_update" or "phases" in response:
+                phases, steps, problem = self._phases_from_model(response.get("phases") or [])
+                if problem:
+                    repaired = self.model.invoke(
+                        [
+                            SystemMessage(content=_REPAIR_SYSTEM),
+                            HumanMessage(
+                                content=(
+                                    f"User feedback: {user_feedback}\n\n"
+                                    f"Draft phases:\n{content}\n\n"
+                                    f"What is wrong:\n{problem}"
+                                )
+                            ),
+                        ]
+                    )
+                    repaired_text = repaired.content if isinstance(repaired.content, str) else str(repaired.content)
+                    revised = _json_object(_strip_fence(repaired_text))
+                    phases, steps, problem = self._phases_from_model(revised.get("phases") or [])
+                if problem:
+                    return current_phases, current_steps, f"The updated phases are not executable. {problem}"
+                reasoning = response.get("reasoning") or "Plan refined based on user feedback."
                 return phases, steps, reasoning
             else:
-                # Legacy format without type field, assume it's a plan update
-                phases = [TestPhase.model_validate(p) for p in response.get("phases", [])]
-                steps = [TestStep.model_validate(s) for s in response.get("steps", [])]
-                reasoning = response.get("reasoning", "Plan refined based on user feedback.")
-                return phases, steps, reasoning
+                return current_phases, current_steps, response.get("answer") or response.get("reasoning") or "Answer provided."
         except Exception as exc:  # noqa: BLE001
             import traceback
             logger.warning(f"Failed to refine plan: {exc}\n{traceback.format_exc()}")
