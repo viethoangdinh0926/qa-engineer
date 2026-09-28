@@ -1,5 +1,6 @@
 """Headless Chromium driver. It does not need a desktop session."""
 
+import os
 from aqe.errors import HarnessError
 from aqe.state import GUIAction
 
@@ -86,7 +87,32 @@ class PlaywrightDriver:
             raise HarnessError("browser_launch_failed", "Playwright is not installed.") from exc
         try:
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=True)
+            
+            # Check if system Chrome should be used
+            use_system_chrome = os.environ.get('USE_SYSTEM_CHROME', 'false').lower() == 'true'
+            chrome_path = os.environ.get('CHROME_EXECUTABLE_PATH')
+            
+            launch_args = {
+                'headless': True,
+                'args': [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu'
+                ]
+            }
+            
+            if use_system_chrome or chrome_path:
+                # Use system Chrome
+                if chrome_path and os.path.exists(chrome_path):
+                    launch_args['executable_path'] = chrome_path
+                    launch_args['channel'] = None
+                else:
+                    # Try to find system Chrome automatically
+                    launch_args['channel'] = 'chrome'
+                    launch_args['executable_path'] = None
+            
+            self._browser = self._playwright.chromium.launch(**launch_args)
             self._page = self._browser.new_page()
         except Exception as exc:
             self.close()
