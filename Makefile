@@ -71,17 +71,20 @@ serve-container:
 		-e PYTHONUNBUFFERED=1 \
 		$(SERVICE_IMAGE) \
 		bash -c "apt-get update && \
-			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git && \
+			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git \
+			libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 && \
 			pip3 install --break-system-packages uv && \
 			cd /app && \
 			uv venv --clear && \
 			. .venv/bin/activate && \
 			uv pip install -e . && \
+			NODE_TLS_REJECT_UNAUTHORIZED=0 uv run playwright install chromium && \
+			uv run playwright install-deps && \
 			uv run aqe serve"
 	@echo "Service running on http://localhost:$(SERVICE_HOST_PORT)"
 	@echo "Container runs as root user for full privileges"
-	@echo "Container uses host networking (can access host services via localhost)"
-	@echo "Playwright Chromium will be installed on-demand when browser is needed"
+	@echo "Container uses host networking (can access host services via localhost"
+	@echo "Playwright Chromium has been installed"
 	@echo "To stop: make stop-container"
 	@echo "To view logs: docker logs aqe-service -f"
 
