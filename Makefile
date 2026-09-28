@@ -4,6 +4,10 @@ SERVICE_IMAGE ?= ubuntu:24.04
 SERVICE_HOST_PORT ?= 8000
 SERVICE_CONTAINER_PORT ?= 8000
 
+# Playwright cache configuration
+USE_HOST_PLAYWRIGHT_CACHE ?= false
+HOST_PLAYWRIGHT_CACHE ?= ~/.cache/ms-playwright
+
 .PHONY: help install install-browser test test-integration run serve serve-container stop-container
 
 help:
@@ -17,6 +21,14 @@ help:
 	@echo "  serve              requires install-browser"
 	@echo "  serve-container     Run service in Ubuntu container with code volume mount"
 	@echo "  stop-container      Stop and remove the service container"
+	@echo ""
+	@echo "Playwright Cache Configuration:"
+	@echo "  USE_HOST_PLAYWRIGHT_CACHE    Use host Playwright cache (default: false)"
+	@echo "  HOST_PLAYWRIGHT_CACHE         Path to host Playwright cache (default: ~/.cache/ms-playwright)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make serve-container USE_HOST_PLAYWRIGHT_CACHE=true"
+	@echo "  make serve-container USE_HOST_PLAYWRIGHT_CACHE=true HOST_PLAYWRIGHT_CACHE=/path/to/cache"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make install            Create .venv and install aqe"
@@ -61,30 +73,56 @@ serve-container:
 	# Start service in Ubuntu container as root user for full privileges
 	# This allows automatic tool installation (curl, wget, jq, Python, etc.) when needed
 	# Using --network host to allow container to access host services via localhost
-	docker run -d --name aqe-service \
-		--network host \
-		-v $(PWD):/app \
-		-v $(PWD)/runs:/app/runs \
-		-e HOST=0.0.0.0 \
-		-e PORT=$(SERVICE_CONTAINER_PORT) \
-		-e DEBIAN_FRONTEND=noninteractive \
-		-e PYTHONUNBUFFERED=1 \
-		$(SERVICE_IMAGE) \
-		bash -c "apt-get update && \
-			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git \
-			libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 && \
-			pip3 install --break-system-packages uv && \
-			cd /app && \
-			uv venv --clear && \
-			. .venv/bin/activate && \
-			uv pip install -e . && \
-			NODE_TLS_REJECT_UNAUTHORIZED=0 uv run playwright install chromium && \
-			uv run playwright install-deps && \
-			uv run aqe serve"
+	@if [ "$(USE_HOST_PLAYWRIGHT_CACHE)" = "true" ]; then \
+		docker run -d --name aqe-service \
+			--network host \
+			-v $(PWD):/app \
+			-v $(PWD)/runs:/app/runs \
+			-v $(HOST_PLAYWRIGHT_CACHE):/root/.cache/ms-playwright \
+			-e HOST=0.0.0.0 \
+			-e PORT=$(SERVICE_CONTAINER_PORT) \
+			-e DEBIAN_FRONTEND=noninteractive \
+			-e PYTHONUNBUFFERED=1 \
+			$(SERVICE_IMAGE) \
+			bash -c "apt-get update && \
+				apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git \
+				libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 && \
+				pip3 install --break-system-packages uv && \
+				cd /app && \
+				uv venv --clear && \
+				. .venv/bin/activate && \
+				uv pip install -e . && \
+				uv run aqe serve"; \
+	else \
+		docker run -d --name aqe-service \
+			--network host \
+			-v $(PWD):/app \
+			-v $(PWD)/runs:/app/runs \
+			-e HOST=0.0.0.0 \
+			-e PORT=$(SERVICE_CONTAINER_PORT) \
+			-e DEBIAN_FRONTEND=noninteractive \
+			-e PYTHONUNBUFFERED=1 \
+			$(SERVICE_IMAGE) \
+			bash -c "apt-get update && \
+				apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git \
+				libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 && \
+				pip3 install --break-system-packages uv && \
+				cd /app && \
+				uv venv --clear && \
+				. .venv/bin/activate && \
+				uv pip install -e . && \
+				NODE_TLS_REJECT_UNAUTHORIZED=0 uv run playwright install chromium && \
+				uv run playwright install-deps && \
+				uv run aqe serve"; \
+	fi
 	@echo "Service running on http://localhost:$(SERVICE_HOST_PORT)"
 	@echo "Container runs as root user for full privileges"
 	@echo "Container uses host networking (can access host services via localhost"
-	@echo "Playwright Chromium has been installed"
+	@if [ "$(USE_HOST_PLAYWRIGHT_CACHE)" = "true" ]; then \
+		echo "Using host Playwright cache from $(HOST_PLAYWRIGHT_CACHE)"; \
+	else \
+		echo "Playwright Chromium has been installed"; \
+	fi
 	@echo "To stop: make stop-container"
 	@echo "To view logs: docker logs aqe-service -f"
 
