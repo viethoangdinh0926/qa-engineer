@@ -18,18 +18,9 @@ help:
 	@echo "  serve-container     Run service in Ubuntu container with code volume mount"
 	@echo "  stop-container      Stop and remove the service container"
 	@echo ""
-	@echo "System Chrome Configuration (alternative to downloading Playwright Chrome):"
-	@echo "  USE_SYSTEM_CHROME         Use system Chrome instead of downloading (default: false)"
-	@echo "  CHROME_EXECUTABLE_PATH   Path to Chrome executable (auto-detected if not set)"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make install-browser USE_SYSTEM_CHROME=true"
-	@echo "  make serve-container USE_SYSTEM_CHROME=true"
-	@echo "  USE_SYSTEM_CHROME=true CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome make serve-container"
-	@echo ""
 	@echo "Targets:"
 	@echo "  make install            Create .venv and install aqe"
-	@echo "  make install-browser    Download Playwright Chromium or use system Chrome"
+	@echo "  make install-browser    Download Playwright Chromium"
 	@echo "  make test               Run the unit tests"
 	@echo "  make test-integration   Run the Playwright test"
 	@echo "  make run                Run SPEC_PATH from .env"
@@ -47,18 +38,8 @@ $(VENV)/.install: pyproject.toml
 install-browser: $(VENV)/.install-browser
 
 $(VENV)/.install-browser: $(VENV)/.install
-	@if [ -f .env ]; then \
-		. ./.env && \
-		if [ "$$USE_SYSTEM_CHROME" = "true" ]; then \
-			echo "Using system Chrome instead of downloading Playwright Chrome"; \
-		else \
-			NODE_TLS_REJECT_UNAUTHORIZED=0 $(UV) run playwright install chromium; \
-			$(UV) run playwright install-deps; \
-		fi; \
-	else \
-		NODE_TLS_REJECT_UNAUTHORIZED=0 $(UV) run playwright install chromium; \
-		$(UV) run playwright install-deps; \
-	fi
+	NODE_TLS_REJECT_UNAUTHORIZED=0 $(UV) run playwright install chromium
+	$(UV) run playwright install-deps
 	@touch $@
 
 test: $(VENV)/.install
@@ -88,27 +69,17 @@ serve-container:
 		-e PORT=$(SERVICE_CONTAINER_PORT) \
 		-e DEBIAN_FRONTEND=noninteractive \
 		-e PYTHONUNBUFFERED=1 \
-		--env-file .env \
 		$(SERVICE_IMAGE) \
 		bash -c "apt-get update && \
-			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git wget gnupg \
+			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git \
 			libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 && \
-			if [ \"\$$USE_SYSTEM_CHROME\" = 'true' ]; then \
-				echo 'Installing system Chrome...'; \
-				wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
-				sh -c 'echo \"deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main\" >> /etc/apt/sources.list.d/google.list' && \
-				apt-get update && \
-				apt-get install -y google-chrome-stable; \
-			fi && \
 			pip3 install --break-system-packages uv && \
 			cd /app && \
 			uv venv --clear && \
 			. .venv/bin/activate && \
 			uv pip install -e . && \
-			if [ \"\$$USE_SYSTEM_CHROME\" != 'true' ]; then \
-				NODE_TLS_REJECT_UNAUTHORIZED=0 uv run playwright install chromium && \
-				uv run playwright install-deps; \
-			fi && \
+			NODE_TLS_REJECT_UNAUTHORIZED=0 uv run playwright install chromium && \
+			uv run playwright install-deps && \
 			uv run aqe serve"
 	@echo "Service running on http://localhost:$(SERVICE_HOST_PORT)"
 	@echo "Container runs as root user for full privileges"

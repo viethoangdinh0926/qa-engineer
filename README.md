@@ -441,35 +441,6 @@ uv run playwright install chromium
 uv run playwright install-deps
 ```
 That install includes Playwright, the OpenAI, Anthropic, and Ollama clients, and pytest. Chromium is downloaded by the commands above. For coding operations, install the Pi agent separately. Copy `.env_template` to `.env` and set `LLM_PROVIDER` to `openai`, `anthropic`, or `ollama`, plus `LLM_MODEL` and the matching credentials. OpenAI can use `OPENAI_API_KEY`, an AIA gateway (`AIA_GATEWAY_CLIENT_ID`, `AIA_GATEWAY_CLIENT_SECRET`, `AIA_GATEWAY_BASE_URL`), or `REALLM_BASE_URL` with `REALLM_API_KEY`. Set `SSL_VERIFY=false` only when the gateway certificate cannot be verified. Optionally set `PI_LLM_MODEL` to specify which LLM model the Pi agent should use for coding operations.
-
-### System Chrome Configuration
-
-If you encounter firewall or proxy issues when downloading Playwright's bundled Chrome, you can use system Chrome instead:
-
-**Environment Variables:**
-- `USE_SYSTEM_CHROME`: Use system Chrome instead of downloading (set to `true`)
-- `CHROME_EXECUTABLE_PATH`: Path to Chrome executable (auto-detected if not set)
-
-**Examples:**
-```bash
-# Use system Chrome
-USE_SYSTEM_CHROME=true make install-browser
-USE_SYSTEM_CHROME=true make serve-container
-
-# With explicit Chrome path
-USE_SYSTEM_CHROME=true CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome make serve-container
-```
-
-**For Docker Containers:**
-When using `make serve-container USE_SYSTEM_CHROME=true`, the system will automatically install Google Chrome in the container before starting the service.
-
-**System Chrome Prerequisites:**
-When using `USE_SYSTEM Chrome=true`, ensure Chrome is installed:
-- Linux: `sudo apt-get install google-chrome-stable` or download from google.com/chrome
-- macOS: Download from google.com/chrome or `brew install --cask google-chrome`
-- Windows: Download from google.com/chrome
-
-The system will auto-detect Chrome in common locations, or you can specify the path with `CHROME_EXECUTABLE_PATH`.
 Headless Playwright does not need a display.
 ## Run a specification
 `aqe run` and `aqe serve` take no flags. Set the command parameters in `.env`.

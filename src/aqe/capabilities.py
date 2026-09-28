@@ -43,34 +43,6 @@ def _probe_browser() -> CapabilityFlag:
             available=False,
             detail="Playwright is not installed.",
         )
-    
-    # Check if system Chrome should be used
-    use_system_chrome = os.environ.get('USE_SYSTEM_CHROME', 'false').lower() == 'true'
-    chrome_path = os.environ.get('CHROME_EXECUTABLE_PATH')
-    
-    if use_system_chrome or chrome_path:
-        # Check if system Chrome is available
-        if chrome_path and os.path.exists(chrome_path):
-            return CapabilityFlag(available=True, detail=None)
-        
-        # Try to find system Chrome automatically
-        common_paths = [
-            '/usr/bin/google-chrome',
-            '/usr/bin/chromium-browser',
-            '/usr/bin/chromium',
-            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        ]
-        
-        for path in common_paths:
-            if os.path.exists(path):
-                return CapabilityFlag(available=True, detail=None)
-        
-        return CapabilityFlag(
-            available=False,
-            detail="System Chrome not found. Install Chrome or set USE_SYSTEM_CHROME=false to download Playwright Chrome.",
-        )
-    
-    # Standard Playwright Chrome download
     try:
         from playwright.sync_api import sync_playwright
 
