@@ -17,6 +17,60 @@ function statusClass(value) {
   return String(value || "pending").replace(/[^a-z]/g, "");
 }
 
+function formatEvidenceValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "object") {
+    if (Array.isArray(value)) {
+      // Special handling for results array to preserve HTML
+      if (value.length > 0 && typeof value[0] === "object" && value[0].hasOwnProperty("content")) {
+        return value.map((item, index) => {
+          const lines = [];
+          lines.push(`[${index}]`);
+          for (const [key, val] of Object.entries(item)) {
+            if (key === "content" && typeof val === "string" && val.length > 0) {
+              const preview = val.substring(0, 50) + (val.length > 50 ? "..." : "");
+              lines.push(`  ${key}: <details><summary>${preview}</summary><pre>${val}</pre></details>`);
+            } else if (typeof val === "object" && val !== null) {
+              lines.push(`  ${key}: ${formatEvidenceValue(val)}`);
+            } else {
+              lines.push(`  ${key}: ${String(val)}`);
+            }
+          }
+          return lines.join("\n");
+        }).join("\n\n");
+      }
+      return value.map((item, index) => {
+        if (typeof item === "object") {
+          return `[${index}] ${formatEvidenceValue(item)}`;
+        }
+        return `[${index}] ${String(item)}`;
+      }).join("\n");
+    }
+    // Handle objects (like coding results)
+    const lines = [];
+    for (const [key, val] of Object.entries(value)) {
+      if (typeof val === "object" && val !== null) {
+        lines.push(`${key}: ${formatEvidenceValue(val)}`);
+      } else {
+        // Make file content collapsible
+        if (key === "content" && typeof val === "string" && val.length > 0) {
+          const preview = val.substring(0, 50) + (val.length > 50 ? "..." : "");
+          lines.push(`${key}: <details><summary>${preview}</summary><pre>${val}</pre></details>`);
+        } else {
+          lines.push(`${key}: ${String(val)}`);
+        }
+      }
+    }
+    return lines.join("\n");
+  }
+  return String(value);
+}
+
 function runLabel(run) {
   if (run.ready && run.report && run.report.verdict) {
     return run.report.verdict;
@@ -274,9 +328,9 @@ function stepDetails(step, detailed) {
     const evidence = step.evidence || {};
     const keys = Object.keys(evidence).filter((key) => key !== "page_source" && evidence[key]);
     if (keys.length) {
-      const block = document.createElement("pre");
+      const block = document.createElement("div");
       block.className = "evidence";
-      block.textContent = keys.map((key) => `${key}: ${evidence[key]}`).join("\n");
+      block.innerHTML = keys.map((key) => `<div><strong>${key}:</strong><br>${formatEvidenceValue(evidence[key])}</div>`).join("<br>");
       body.append(block);
     }
   } else if (!checks.length && step.summary) {
