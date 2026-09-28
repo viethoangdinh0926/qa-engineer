@@ -1,1 +1,1 @@
-"""Sandboxed programmatic execution."""
+"""Host environment CLI execution."""

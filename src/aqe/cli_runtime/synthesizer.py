@@ -40,32 +40,6 @@ def _bash_runner(script_path: Path, result_path: Path) -> str:
     )
 
 
-def ensure_container_name_available(container_name: str) -> bool:
-    """Check if a container name is available and remove existing container if needed."""
-    try:
-        # Check if container name is already in use
-        result = subprocess.run(
-            ["docker", "inspect", "--format='{{.Id}}'", container_name],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        # If container exists, remove it
-        if result.returncode == 0 and result.stdout.strip():
-            logger.info(f"Container {container_name} already exists, removing it")
-            subprocess.run(
-                ["docker", "rm", "-f", container_name],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        return True
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning(f"Failed to check container name availability for {container_name}: {exc}")
-        return False
-
-
 def ensure_tool_available(tool_name: str) -> bool:
     """Check if a tool is available and try to install it if not."""
     # Check if tool is available
@@ -168,16 +142,6 @@ class CLISubsystem:
         try:
             # Clean the command string - remove any problematic characters
             command = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', command)
-
-            # Check for container names in Docker commands and ensure they're available
-            if "docker" in command.lower():
-                # Look for --name flag in Docker commands
-                name_match = re.search(r'--name\s+(\S+)', command)
-                if name_match:
-                    container_name = name_match.group(1)
-                    # Ensure the container name is available
-                    if not ensure_container_name_available(container_name):
-                        logger.warning(f"Could not ensure container name {container_name} is available, proceeding anyway")
 
             # Set up environment variables for consistent Python package location
             env = {

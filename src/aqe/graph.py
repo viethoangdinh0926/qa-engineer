@@ -702,9 +702,7 @@ def finish_node(state: AgentState, deps: GraphDeps) -> dict:
     elif reason_code == "assertion_failed":
         verdict = "fail"
     elif reason_code in {
-        "sandbox_start_failed",
         "browser_launch_failed",
-        "desktop_input_failed",
         "driver_timeout",
         "engine_error",
         "coding_agent_failed",

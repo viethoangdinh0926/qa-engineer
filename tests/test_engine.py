@@ -53,19 +53,6 @@ class RecordingDriver:
         return None
 
 
-class FixedSandbox:
-    def start_container(self, run_dir: Path, work_dir: Path, *, network: bool = False) -> str:
-        del run_dir, work_dir, network
-        return "test-container-id"
-
-    def stop_container(self) -> None:
-        return None
-
-    def run(self, script: str, evidence_dir: Path, work_dir: Path, *, network: bool = False) -> tuple[str, str]:
-        del script, evidence_dir, work_dir, network
-        return json.dumps({"ok": True, "user": "ada"}), ""
-
-
 class LabeledPlanner:
     def plan(self, specification: str):
         text = specification.strip()
@@ -143,7 +130,7 @@ def test_cli_stdout_and_stderr_are_judged_with_the_assertion(tmp_path: Path) -> 
 
         def judge(self, question: str, text: str) -> Judgment:
             self.calls.append((question, text))
-            return Judgment(passed=True, judgment="stdout prints sandbox, which is a username.")
+            return Judgment(passed=True, judgment="stdout prints testuser, which is a username.")
 
     judge = CaptureJudge()
     service = _service(tmp_path, judge=judge)
@@ -158,7 +145,7 @@ def test_cli_stdout_and_stderr_are_judged_with_the_assertion(tmp_path: Path) -> 
     assert "stdout:" in text
     assert "stderr:" in text
     assert "Verification statement:" in text
-    assert step["judgment"] == "stdout prints sandbox, which is a username."
+    assert step["judgment"] == "stdout prints testuser, which is a username."
     assert step["verification_results"][0]["passed"] is True
 
 
@@ -681,12 +668,6 @@ def test_planner_setup_failure_finishes_the_run(tmp_path: Path, monkeypatch) -> 
     assert "missing its client package" in finished["report"]["reason"]
 
 
-def test_sandbox_start_is_a_system_error(tmp_path: Path) -> None:
-    # This test is no longer valid as sandbox has been removed
-    # CLI steps now execute in host environment
-    pass
-
-
 def test_nonsense_and_garbage_are_rejected(tmp_path: Path) -> None:
     service = _service(tmp_path)
     finished = service.wait(service.submit(NONSENSE_SPEC)["id"])
@@ -948,20 +929,6 @@ def test_a_requested_coding_phase_is_kept() -> None:
     )
     assert missing_ops is not None
     assert "coding operations" in missing_ops
-    desktop = _validate_phases(
-        [
-            TestPhase(
-                phase=1,
-                name="Click Save",
-                interface="GUI",
-                gui_driver="desktop",
-                operation_notes=["click Save"],
-                verifications=["The page shows saved."],
-            )
-        ]
-    )
-    assert desktop is not None
-    assert "desktop application" in desktop.lower()
 
 
 def test_coding_operations_accept_the_models_field_names() -> None:

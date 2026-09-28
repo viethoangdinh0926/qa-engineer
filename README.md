@@ -2,6 +2,17 @@
 `aqe` is a quality-engineering service that turns a specification into a test plan, runs each step through a browser, CLI, or coding agent adapter, and returns one JSON report.
 A run moves through plan, capability check, execute, validate, and reflect. The same run is available to a person in the browser, to a script over HTTP, and to another agent over [A2A](https://github.com/a2aproject/A2A).
 
+## Human-in-the-Loop Planner
+
+The system features a human-in-the-loop planner that allows users to review, refine, and approve test plans before execution:
+
+- **Draft Plans**: Plans are initially generated in "draft" status
+- **Plan Review**: Users can review the plan through the web UI or API
+- **Interactive Refinement**: A chat interface allows users to request changes to the plan
+- **Plan Approval**: Execution only begins after the user approves the plan
+- **Plan History**: All plan versions are stored with version tracking
+- **Re-run Capability**: Users can re-trigger execution for completed/failed runs using the approved plan
+
 ## System Architecture
 
 ```mermaid
@@ -18,6 +29,7 @@ graph TB
         Planner["ChatModelPlanner<br/>AI-powered test planning<br/>(OpenAI/Anthropic/Ollama)"]
         Capability["Capability Probe<br/>Check available drivers"]
         Judge["Page Judge<br/>Assertion validation"]
+        PlanStorage["PlanStorageManager<br/>Plan persistence & versioning"]
     end
 
     subgraph Execution["Execution Subsystems"]
@@ -25,7 +37,6 @@ graph TB
         CLISub["CLI Subsystem"]
         CodingSub["Coding Subsystem"]
         Playwright["Playwright Driver<br/>Browser automation"]
-        Desktop["PyAutoGUI Driver<br/>Desktop automation"]
         HostCLI["Host CLI<br/>Direct command execution"]
         PiAgent["Pi Agent<br/>Code operations"]
     end
@@ -34,6 +45,7 @@ graph TB
         Report["JSON Report<br/>runs/<id>/report.json"]
         SSE["Server-Sent Events<br/>Real-time snapshots"]
         Evidence["Evidence Collection<br/>Screenshots, stdout, page source"]
+        UI["Web UI<br/>Plan review & approval<br/>Chat interface"]
     end
 
     CLI --> RunService
@@ -44,21 +56,21 @@ graph TB
     LangGraph --> Planner
     LangGraph --> Capability
     LangGraph --> Judge
+    LangGraph --> PlanStorage
 
     Planner --> LangGraph
     Capability --> LangGraph
+    PlanStorage --> LangGraph
 
     LangGraph --> GUISub
     LangGraph --> CLISub
     LangGraph --> CodingSub
 
     GUISub --> Playwright
-    GUISub --> Desktop
     CLISub --> HostCLI
     CodingSub --> PiAgent
 
     Playwright --> Evidence
-    Desktop --> Evidence
     HostCLI --> Evidence
     PiAgent --> Evidence
 
@@ -68,6 +80,8 @@ graph TB
     LangGraph --> Report
     LangGraph --> SSE
     RunService --> SSE
+    RunService --> UI
+    PlanStorage --> UI
 
     style Entry_Points fill:#e1f5ff
     style Core_Engine fill:#fff4e1
@@ -79,24 +93,31 @@ graph TB
 
 1. **Specification Input**: User provides natural language test specification via CLI, HTTP API, or A2A
 2. **Planning**: ChatModelPlanner converts specification into structured test steps using LLM
-3. **Capability Check**: System verifies required drivers (browser, coding agent) are available
-4. **Execution**: Steps are routed to appropriate subsystem:
+3. **Plan Storage**: Draft plan is saved to file system with version tracking
+4. **Plan Review**: User reviews the plan through web UI or API endpoints
+5. **Interactive Refinement**: User can request changes via chat interface to refine the plan
+6. **Plan Approval**: User approves the plan (status changes from "draft" to "approved")
+7. **Capability Check**: System verifies required drivers (browser, coding agent) are available
+8. **Execution**: Steps are routed to appropriate subsystem:
    - GUI steps → Playwright (browser)
    - CLI steps → Host environment with direct CLI commands or Python scripts
    - CODING steps → Pi agent subprocess for code operations
-5. **Validation**: Judge evaluates assertions against collected evidence
-6. **Reporting**: JSON report generated with verdict, evidence, and step details
-7. **Real-time Monitoring**: Server-sent events provide live progress updates
+9. **Validation**: Judge evaluates assertions against collected evidence
+10. **Reporting**: JSON report generated with verdict, evidence, and step details
+11. **Real-time Monitoring**: Server-sent events provide live progress updates
+12. **Re-run Capability**: Users can re-trigger execution for completed/failed runs using the approved plan
 
 ## LangGraph State Machine
 
-The core execution engine is a LangGraph state machine that orchestrates the testing lifecycle through 9 nodes:
+The core execution engine is a LangGraph state machine that orchestrates the testing lifecycle through 10 nodes:
 
 ```mermaid
 graph TD
     Start([Start]) --> plan
-    plan -->|accepted| preflight
-    plan -->|rejected| finish
+    plan -->|check approved plan| preflight
+    plan -->|no approved plan| generate_plan
+    generate_plan -->|plan generated| preflight
+    generate_plan -->|invalid plan| finish
     preflight -->|capabilities OK| route
     preflight -->|missing capabilities| finish
     route -->|GUI step| execute_gui
@@ -115,6 +136,7 @@ graph TD
     done --> END([END])
 
     style plan fill:#ff9999,color:#0000ff
+    style generate_plan fill:#ffcccc,color:#0000ff
     style preflight fill:#99ff99,color:#0000ff
     style route fill:#9999ff,color:#0000ff
     style execute_gui fill:#ffff99,color:#0000ff
@@ -128,32 +150,40 @@ graph TD
 
 ### Node Responsibilities
 
-#### 1. **plan_node** - Test Planning
+#### 1. **plan_node** - Plan Approval Check
+- **Input**: Run state with run_id
+- **Process**: Checks if an approved plan exists for the run
+- **Success**: If approved plan exists, transitions to `preflight` with the approved plan
+- **Plan Generation**: If no approved plan exists, transitions to `generate_plan` to create a new plan
+- **Failure**: If plan generation fails, transitions to `finish` with `not_a_test_plan` reason code
+
+#### 2. **generate_plan_node** - Test Plan Generation
 - **Input**: Natural language specification
 - **Process**: Calls ChatModelPlanner to convert specification into structured test steps
 - **Validation**: Checks that steps have valid shape (non-empty action, assertion, correct interface/driver)
+- **Plan Storage**: Saves the generated plan to file system with version tracking
 - **Success**: Transitions to `preflight` with test matrix and step views
 - **Failure**: Transitions to `finish` with `not_a_test_plan` reason code
 
-#### 2. **preflight_node** - Capability Check
+#### 3. **preflight_node** - Capability Check
 - **Process**: Probes host for available capabilities (browser, coding agent, LLM)
 - **Validation**: Compares required capabilities from test matrix against available ones
 - **Success**: Transitions to `route` if all required capabilities are available
 - **Failure**: Transitions to `finish` with `missing_capability` reason code
 
-#### 3. **route_node** - Step Routing
+#### 4. **route_node** - Step Routing
 - **Process**: Determines next step to execute or checks completion
 - **Cancel Check**: If cancel requested, transitions to `finish` with `canceled` reason code
 - **Completion Check**: If all steps executed, transitions to `finish` with success
 - **Routing**: Sets current step to `running` and routes to `execute_gui`, `execute_cli`, or `execute_coding` based on interface
 
-#### 4. **execute_gui_node** - GUI Execution
-- **Process**: Executes GUI step through GUISubsystem (Playwright or PyAutoGUI)
+#### 5. **execute_gui_node** - GUI Execution
+- **Process**: Executes GUI step through GUISubsystem (Playwright)
 - **Evidence Collection**: Captures screenshots, page source, and page text
 - **Success**: Transitions to `validate` with ActionResult
 - **Error**: Transitions to `finish` with appropriate error code (browser_launch_failed, engine_error, etc.)
 
-#### 5. **execute_cli_node** - CLI Execution
+#### 6. **execute_cli_node** - CLI Execution
 - **Process**: Executes CLI step through CLISubsystem in host environment
 - **Command Execution**: Uses direct CLI commands or Python scripts based on complexity
 - **Tool Installation**: Automatically installs missing tools (curl, wget, jq, etc.) if needed
@@ -161,7 +191,7 @@ graph TD
 - **Success**: Transitions to `validate` with ActionResult
 - **Error**: Transitions to `finish` with `engine_error` or other error codes
 
-#### 6. **execute_coding_node** - Coding Agent Execution
+#### 7. **execute_coding_node** - Coding Agent Execution
 - **Process**: Executes CODING step through CodingSubsystem with Pi agent subprocess
 - **Pi Agent Management**: Starts Pi agent in RPC mode for code operations
 - **Code Operations**: Supports create_file, update_file, review_code, execute_code
@@ -169,7 +199,7 @@ graph TD
 - **Success**: Transitions to `validate` with ActionResult
 - **Error**: Transitions to `finish` with `coding_agent_failed` or `coding_agent_not_available`
 
-#### 7. **validate_node** - Assertion Validation
+#### 8. **validate_node** - Assertion Validation
 - **Process**: Evaluates step assertions against collected evidence
 - **Validation Methods**:
   - Structured checks (`contains:`, `json:`, `status:`) → direct evaluation
@@ -180,12 +210,12 @@ graph TD
 - **Retry**: If failed and retries remaining, transitions to `reflect` with retry status
 - **Failure**: If failed and no retries left, transitions to `finish` with `assertion_failed` reason code
 
-#### 8. **reflect_node** - Retry Reflection
+#### 9. **reflect_node** - Retry Reflection
 - **Process**: Placeholder for future retry logic improvements
 - **Current Behavior**: Simply transitions back to `route` for retry attempt
 - **Purpose**: Allows for intelligent retry strategies (e.g., adjusting parameters, waiting)
 
-#### 9. **finish_node** - Report Generation
+#### 10. **finish_node** - Report Generation
 - **Process**: Determines final verdict based on execution results
 - **Verdict Logic**:
   - `canceled` → if cancel was requested
@@ -219,6 +249,69 @@ The `AgentState` tracks execution progress:
 }
 ```
 
+### Human-in-the-Loop Planner
+
+The system includes a human-in-the-loop planner that allows users to review and approve test plans before execution.
+
+#### Plan Status Flow
+
+1. **draft**: Initial plan generated by the planner
+2. **approved**: Plan approved by user, ready for execution
+3. **rejected**: Plan rejected by user
+
+#### Plan Storage
+
+Plans are stored in the file system under `runs/<run_id>/plan.json` with version tracking:
+- Each plan version is stored in `runs/<run_id>/plans/v<version>.json`
+- Current approved plan is linked from `runs/<run_id>/plan.json`
+- Plan history includes metadata (timestamp, version, status)
+
+#### API Endpoints
+
+**Plan Management:**
+- `GET /v1/runs/{run_id}/plan` - Get current plan
+- `POST /v1/runs/{run_id}/plan/approve` - Approve plan and start execution
+- `POST /v1/runs/{run_id}/plan/reject` - Reject plan
+- `GET /v1/runs/{run_id}/plan/download` - Download plan as markdown file
+
+**Planner Chat:**
+- `POST /v1/runs/{run_id}/planner/chat` - Send message to planner for plan refinement
+- `GET /v1/runs/{run_id}/planner/chat/history` - Get chat history
+
+**Execution Control:**
+- `POST /v1/runs/{run_id}:start` - Start execution (for re-running completed/failed runs)
+
+#### Web UI Features
+
+The web UI provides:
+- **Plan Display**: Shows the current plan in markdown format
+- **Chat Panel**: Interactive chat interface for plan refinement
+- **Approval Controls**: Approve/Reject/Request Changes buttons
+- **Plan Download**: Download plan as markdown file
+- **Re-run Button**: Re-trigger execution for completed/failed runs
+- **Real-time Updates**: Step status updates via SSE
+
+#### Plan Refinement Workflow
+
+1. User submits specification
+2. Planner generates initial plan (status: draft)
+3. User reviews plan in web UI
+4. User can:
+   - Approve plan → execution starts
+   - Reject plan → run marked as rejected
+   - Request changes via chat → planner refines plan
+5. After refinement, user can approve the updated plan
+6. Execution begins with approved plan
+
+#### Re-run Capability
+
+For runs in terminal states (completed, failed, canceled):
+- User can click "Re-run Plan" button
+- System re-uses the approved plan
+- Run record is reset
+- Execution starts with the same plan
+- Useful for debugging or retrying after fixing issues
+
 ### Error Handling
 
 The state machine handles errors at multiple levels:
@@ -231,6 +324,22 @@ The state machine handles errors at multiple levels:
   - CODING: `coding_agent_failed`, `coding_agent_not_available`
 - **Validation Errors**: Assertion failures → `assertion_failed` (with retry)
 - **System Errors**: Unexpected exceptions → `engine_error`
+- **Plan Validation Errors**: Invalid step structure → marks step as ERROR, subsequent steps as SKIPPED, transitions to `finish` with `engine_error`
+
+#### Error Handling Improvements
+
+The system now includes comprehensive error handling to prevent steps from getting stuck in retrying states:
+
+1. **Validation Error Handling**: Catches validation errors during step execution and marks the step as ERROR instead of RETRYING
+2. **Step Status Management**: When an error occurs:
+   - Current step is marked as ERROR
+   - All subsequent steps are marked as SKIPPED
+   - Execution routes to finish with `engine_error` reason code
+3. **Auto-correction**: Common LLM mistakes in action names are automatically corrected:
+   - `execute_command` → `execute_code`
+   - `execute_shell` → `execute_code`
+   - `run_command` → `execute_code`
+   - `run` → `execute_code` (for coding operations)
 
 ### Retry Logic
 
@@ -245,7 +354,6 @@ Failed steps can be retried based on `max_retries` configuration:
 | Interface | Driver | Use Case |
 |-----------|--------|----------|
 | GUI Browser | Playwright | Web application testing |
-| GUI Desktop | PyAutoGUI | Desktop application testing |
 | CLI | Host Environment | Command-line tool testing with automatic tool installation |
 | CODING | Pi Agent | Code operations (file creation, updates, review, execution) |
 
@@ -360,10 +468,28 @@ curl -s -X POST http://127.0.0.1:8000/v1/runs \
   -H 'content-type: application/json' \
   -d '{"specification":"# check\n\nCLI: Read the webhook\nAssertion: json:user=ada\n"}'
 ```
-A blank or oversized specification returns `400` and does not create a run. A valid body returns `202` with an id. Poll `GET /v1/runs/<id>` until `ready` is true, then read `report`. `ready` is true for `completed`, `failed`, `rejected`, and `canceled`. While the run is `submitted` or `working`, `report` is null.
-`GET /v1/runs/<id>/events` is a server-sent stream of the same snapshots. The stream ends on the first snapshot where `ready` is true.
+A blank or oversized specification returns `400` and does not create a run. A valid body returns `202` with an id. The run starts in `submitted` status with a draft plan.
+
+**Plan Management:**
+- `GET /v1/runs/{run_id}/plan` - Get current plan (returns plan with status: draft/approved/rejected)
+- `POST /v1/runs/{run_id}/plan/approve` - Approve plan and start execution (changes status to approved, triggers execution)
+- `POST /v1/runs/{run_id}/plan/reject` - Reject plan (changes status to rejected, run marked as rejected)
+- `GET /v1/runs/{run_id}/plan/download` - Download plan as markdown file
+
+**Planner Chat:**
+- `POST /v1/runs/{run_id}/planner/chat` - Send message to planner for plan refinement (returns updated plan)
+- `GET /v1/runs/{run_id}/planner/chat/history` - Get chat history (returns array of messages)
+
+**Execution Control:**
+- `POST /v1/runs/{run_id}:start` - Start execution (for re-running completed/failed runs with approved plan)
+
+**Monitoring:**
+- `GET /v1/runs/{run_id}` - Get run status (includes plan status, execution status, step views)
+- `GET /v1/runs/{run_id}/events` - Server-sent stream of snapshots (stream ends when run is ready)
+
+Poll `GET /v1/runs/<id>` until `ready` is true, then read `report`. `ready` is true for `completed`, `failed`, `rejected`, and `canceled`. While the run is `submitted` or `working`, `report` is null. Note that execution only starts after plan approval.
 ### A2A
-Discover the agent at `GET /.well-known/agent-card.json`. Send the specification as the text of a `SendMessage` call. The task id is the run id. `SendMessage` returns while the task is `submitted` or `working`. Poll `GetTask` until `status.state` is `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED`, or `TASK_STATE_CANCELED`, then read the JSON artifact. Send `A2A-Version: 1.0`. A message with no text or file part is invalid and does not create a task.
+Discover the agent at `GET /.well-known/agent-card.json`. Send the specification as the text of a `SendMessage` call. The task id is the run id. `SendMessage` returns while the task is `submitted` or `working`. The run starts with a draft plan that must be approved before execution. Poll `GetTask` until `status.state` is `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED`, or `TASK_STATE_CANCELED`, then read the JSON artifact. Send `A2A-Version: 1.0`. A message with no text or file part is invalid and does not create a task.
 ## Report
 Every finished run writes the same `TestReport` object to `runs/<id>/report.json`, to `report` on the HTTP snapshot, and to the A2A artifact.
 `verdict` is the result to branch on:
@@ -383,9 +509,12 @@ uv run pytest -m integration
 `uv run pytest` injects test drivers so it does not launch Chromium. The integration test runs Playwright and the configured chat model, and skips when the browser is not installed.
 ## Layout
 - `src/aqe/graph.py` is the plan, route, execute, validate, and reflect loop.
-- `src/aqe/gui/` captures, grounds, and acts through Playwright or PyAutoGUI.
+- `src/aqe/gui/` captures, grounds, and acts through Playwright.
 - `src/aqe/cli_runtime/` executes CLI commands in the host environment.
 - `src/aqe/coding_agent/` manages Pi agent subprocess for code operations.
 - `src/aqe/api.py` serves the HTTP API, the event stream, the UI, and A2A.
+- `src/aqe/plan_storage.py` manages plan persistence and versioning.
+- `src/aqe/service.py` manages run lifecycle and execution coordination.
+- `src/aqe/ui/` contains the web UI for plan review and approval.
 - `examples/specs/registration.md` is the sample plan. `examples/sut/server.py` is the registration form `aqe run` starts.
 - `examples/specs/coding_example.md` demonstrates coding agent usage.

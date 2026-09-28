@@ -32,7 +32,7 @@ def invoke_json(model: BaseChatModel, messages: list, parser: Callable[[str], T]
 NONSENSE_SPEC = "Hello, this is not a test specification."
 
 _STEP_LINE = re.compile(
-    r"^(?:(\d+)\.\s*)?(GUI|CLI|CODING)(?:\s+(browser|desktop))?\s*:\s*(.+?)\s*$",
+    r"^(?:(\d+)\.\s*)?(GUI|CLI|CODING)(?:\s+(browser))?\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
 )
 _ASSERTION_LINE = re.compile(r"^assertion\s*:\s*(.+)$", re.IGNORECASE)
@@ -125,7 +125,6 @@ class Planner(Protocol):
 _AGENT_CAPABILITIES = (
     "The agent can use three capabilities: a web browser (open a page, type into a field, click a button, press a key), "
     "host CLI tools (shell commands), and a Pi coding agent that generates code and files. "
-    "The agent does not test desktop applications. "
     "A request to generate, write, or create source code or files, or a request for a CODING phase, "
     "is a CODING phase. The Pi coding agent runs it through coding_operations "
     "(create_file, update_file, or review_code), each with file_path, content, and description. "
@@ -150,6 +149,7 @@ _PLAN_SYSTEM = (
     "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
     "interface (GUI, CLI, or CODING), gui_driver (browser or null), operations, script, coding_operations, and verifications. "
     "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
+    "A GUI phase sets gui_driver to browser. "
     "A CLI phase sets interface to CLI and puts the whole bash script in script. "
     "script is one string the agent runs with bash. Include every command, in order, with newlines escaped as \\n. "
     "Use set -e so a failing command stops the script. "
@@ -791,7 +791,7 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
         if interface not in {"GUI", "CLI", "CODING"}:
             if coding_operations:
                 interface = "CODING"
-            elif driver_name in {"browser", "desktop"} or actions:
+            elif driver_name == "browser" or actions:
                 interface = "GUI"
             elif any(check.startswith(("json:", "status:")) for check in verifications):
                 interface = "CLI"
@@ -802,7 +802,7 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
                 )
                 continue
 
-        if interface == "GUI" and driver_name not in {"browser", "desktop"}:
+        if interface == "GUI" and driver_name != "browser":
             driver_name = "browser"
         if interface in {"CLI", "CODING"}:
             driver_name = None
@@ -1092,11 +1092,6 @@ def _validate_phases(phases: list[TestPhase]) -> str | None:
             problems.append(
                 f"{label} is a CODING phase with no coding operations. "
                 "Include coding_operations for the Pi coding agent: create_file, update_file, or review_code."
-            )
-        if phase.interface == "GUI" and phase.gui_driver == "desktop":
-            problems.append(
-                f"{label} targets a desktop application. Desktop applications are not tested. "
-                "Use the browser, a CLI command, or a CODING phase."
             )
         if not phase.verifications:
             problems.append(
