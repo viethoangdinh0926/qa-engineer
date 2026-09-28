@@ -4,10 +4,6 @@ SERVICE_IMAGE ?= ubuntu:24.04
 SERVICE_HOST_PORT ?= 8000
 SERVICE_CONTAINER_PORT ?= 8000
 
-# System Chrome configuration
-USE_SYSTEM_CHROME ?= false
-CHROME_EXECUTABLE_PATH ?=
-
 .PHONY: help install install-browser test test-integration run serve serve-container stop-container
 
 help:
@@ -92,13 +88,12 @@ serve-container:
 		-e PORT=$(SERVICE_CONTAINER_PORT) \
 		-e DEBIAN_FRONTEND=noninteractive \
 		-e PYTHONUNBUFFERED=1 \
-		-e USE_SYSTEM_CHROME=$(USE_SYSTEM_CHROME) \
-		-e CHROME_EXECUTABLE_PATH=$(CHROME_EXECUTABLE_PATH) \
+		--env-file .env \
 		$(SERVICE_IMAGE) \
 		bash -c "apt-get update && \
-			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git \
+			apt-get install -y --no-install-recommends python3 python3-pip python3-venv curl ca-certificates openssl git wget gnupg \
 			libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 && \
-			if [ '$$USE_SYSTEM_CHROME' = 'true' ]; then \
+			if [ \"\$$USE_SYSTEM_CHROME\" = 'true' ]; then \
 				echo 'Installing system Chrome...'; \
 				wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
 				sh -c 'echo \"deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main\" >> /etc/apt/sources.list.d/google.list' && \
@@ -110,7 +105,7 @@ serve-container:
 			uv venv --clear && \
 			. .venv/bin/activate && \
 			uv pip install -e . && \
-			if [ '$$USE_SYSTEM_CHROME' != 'true' ]; then \
+			if [ \"\$$USE_SYSTEM_CHROME\" != 'true' ]; then \
 				NODE_TLS_REJECT_UNAUTHORIZED=0 uv run playwright install chromium && \
 				uv run playwright install-deps; \
 			fi && \
