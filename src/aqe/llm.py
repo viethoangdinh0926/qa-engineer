@@ -320,25 +320,34 @@ _NO_DOCKER_FIX = _section(
 )
 
 _CLI_VERIFICATION = _section(
-    "A CLI verification is decided only from $? , stdout, and stderr after that phase's script runs.",
+    "A CLI verification is decided only from $? , stdout, and stderr after that phase's entire script runs.",
+    "The verification should focus on the overall result of the script, not individual commands within it.",
     "The script must print the evidence the check needs.",
-    "Each CLI verification names what $? , stdout, or stderr must show, in one or two sentences.",
+    "Each CLI verification names what $? , stdout, or stderr must show for the entire script, in one or two sentences.",
     "Do not write a vague check such as 'the background service is running',",
     "'the log is available for later inspection', 'a process is present', or 'the service is listening'.",
     "If a service is started in the background, the same script must then print proof, for example by calling curl on the health URL.",
-    "The verification then says what that command produced, such as '$? is 0 and stdout is OK.'",
+    "The verification then says what that script produced, such as '$? is 0 and stdout is OK.'",
+    "IMPORTANT: Prefer checking the script's overall exit code and combined stdout/stderr over checking individual command outputs.",
+    "For example, if the script runs curl and grep, verify the combined stdout contains the expected text, not just curl's output.",
+    "Example: If a script runs 'curl http://localhost:8080/health', verify 'The script exit code is 0 and stdout contains OK'",
+    "instead of verifying 'curl returned 200' which is not directly observable from the script's output.",
 )
 
 _CLI_VERIFICATION_REPAIR = _section(
-    "A CLI verification is decided only from $? , stdout, and stderr.",
+    "A CLI verification is decided only from $? , stdout, and stderr of the entire script.",
     "The script must print the evidence, and the verification must say what $? , stdout, or stderr must show.",
     "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'.",
+    "Focus on the overall script result, not individual command outputs within the script.",
+    "Prefer checking the script's overall exit code and combined stdout/stderr over checking individual command outputs.",
 )
 
 _CLI_VERIFICATION_UPDATE = _section(
-    "A CLI verification names what $? , stdout, or stderr must show after the script runs.",
+    "A CLI verification names what $? , stdout, or stderr must show after the entire script runs.",
     "The script must print that evidence.",
     "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'.",
+    "Focus on the overall script result, not individual command outputs within the script.",
+    "Prefer checking the script's overall exit code and combined stdout/stderr over checking individual command outputs.",
 )
 
 _AGENT_CAPABILITIES = _prompt(
@@ -397,9 +406,21 @@ _VERIFICATION_STYLE = _section(
     "Express a CLI check as a claim about $? , stdout, or stderr that the script prints.",
     "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr.",
     "Example: 'Run ls. Verify that it returns nothing.' has verification",
-    "'The ls command returns nothing. stdout is empty. A successful exit code does not satisfy this check.'",
+    "'The ls command returns nothing. stdout is empty. A successful exit code is 0, but that does not satisfy this check.'",
     "Example: 'Run curl and verify that it reports an error.' has verification",
     "'The curl command reports an error.' It does not mention stdout.",
+    "IMPORTANT: Make verifications robust and simple. Focus on one clear condition per verification.",
+    "Avoid complex multi-part verifications that combine multiple unrelated checks.",
+    "Use simple, direct checks like 'stdout contains X', 'exit code is 0', 'file exists', or 'process is running'.",
+    "Avoid ambiguous phrasing like 'should', 'must', or 'expected to' - use direct assertions like 'is', 'contains', or 'equals'.",
+    "For string checks, be specific about what to look for (e.g., 'stdout contains OK' instead of 'stdout looks good').",
+    "For file checks, use direct assertions like 'file exists' or 'file contains X' instead of 'file should be present'.",
+    "Simple verifications are easier to judge and less prone to LLM errors.",
+    "IMPORTANT: For cleanup operations (file/folder removal with rm, rmdir, etc.), successful script execution without errors is sufficient evidence.",
+    "If a cleanup script runs 'rm -f file.txt' and exits with code 0 with no stderr errors, conclude the removal was successful.",
+    "You do not need to add explicit verification checks like '! test -f file.txt' after every removal command.",
+    "The absence of errors in the script output is enough to conclude cleanup was successful.",
+    "This makes cleanup phases simpler and more robust.",
 )
 
 _PHASE_LAYOUT = _section(

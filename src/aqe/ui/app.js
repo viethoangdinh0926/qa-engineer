@@ -11,10 +11,27 @@ const state = {
   currentPlan: null,
   currentRunId: null,
   busy: false,
+  view: "home",  // "home" or "run-detail"
+  sidebarClickHandler: null,  // Store the click handler to remove it later
 };
 
 function statusClass(value) {
-  return String(value || "pending").replace(/[^a-z]/g, "");
+  const status = String(value || "pending").toLowerCase();
+  // Map various status values to CSS class names
+  const statusMap = {
+    'pass': 'passed',
+    'fail': 'failed',
+    'error': 'error',
+    'running': 'running',
+    'retrying': 'retrying',
+    'working': 'working',
+    'submitted': 'submitted',
+    'pending': 'pending',
+    'completed': 'completed',
+    'canceled': 'canceled',
+    'rejected': 'rejected',
+  };
+  return statusMap[status] || status.replace(/[^a-z]/g, "");
 }
 
 function formatEvidenceValue(value) {
@@ -98,6 +115,75 @@ async function loadCapabilities() {
 }
 
 function renderShell() {
+  if (state.view === "home") {
+    renderHome();
+  } else if (state.view === "run-detail") {
+    renderRunDetail();
+  }
+}
+
+function renderHome() {
+  app.replaceChildren();
+  
+  // Remove sidebar click handler if exists
+  if (state.sidebarClickHandler) {
+    document.removeEventListener("click", state.sidebarClickHandler);
+    state.sidebarClickHandler = null;
+  }
+  
+  // Main content area (no sidebar on homepage)
+  const mainContent = document.createElement("main");
+  mainContent.className = "main-content home";
+  
+  const form = document.createElement("form");
+  form.className = "card";
+  const heading = document.createElement("h2");
+  heading.textContent = "New test";
+  const label = document.createElement("label");
+  label.className = "field";
+  label.htmlFor = "specification";
+  label.textContent = "Testing request";
+  const area = document.createElement("textarea");
+  area.id = "specification";
+  area.name = "specification";
+  area.placeholder = "Describe what you want to test";
+  const row = document.createElement("div");
+  row.className = "row";
+  const button = document.createElement("button");
+  button.type = "submit";
+  button.id = "submit-spec";
+  button.textContent = "Create plan";
+  row.append(button);
+  const error = document.createElement("p");
+  error.id = "form-error";
+  error.className = "error";
+  error.hidden = true;
+  form.append(heading, label, area, row, error);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    submitSpecification(area, button);
+  });
+
+  const notice = document.createElement("p");
+  notice.id = "notice";
+  notice.className = "notice";
+  notice.hidden = true;
+
+  const section = document.createElement("section");
+  section.className = "section";
+  const runsHeading = document.createElement("h2");
+  runsHeading.textContent = "Testing Runs";
+  const list = document.createElement("div");
+  list.id = "testing-runs";
+  section.append(runsHeading, list);
+  mainContent.append(form, notice, section);
+  app.append(mainContent);
+  
+  // Paint the runs list
+  paintRuns();
+}
+
+function renderRunDetail() {
   app.replaceChildren();
   
   // Create main layout with sidebar
@@ -148,48 +234,56 @@ function renderShell() {
   const mainContent = document.createElement("main");
   mainContent.className = "main-content";
   
-  const form = document.createElement("form");
-  form.className = "card";
-  const heading = document.createElement("h2");
-  heading.textContent = "New test";
-  const label = document.createElement("label");
-  label.className = "field";
-  label.htmlFor = "specification";
-  label.textContent = "Testing request";
-  const area = document.createElement("textarea");
-  area.id = "specification";
-  area.name = "specification";
-  area.placeholder = "Describe what you want to test";
-  const row = document.createElement("div");
-  row.className = "row";
-  const button = document.createElement("button");
-  button.type = "submit";
-  button.id = "submit-spec";
-  button.textContent = "Create plan";
-  row.append(button);
-  const error = document.createElement("p");
-  error.id = "form-error";
-  error.className = "error";
-  error.hidden = true;
-  form.append(heading, label, area, row, error);
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    submitSpecification(area, button);
+  // Back button
+  const backButton = document.createElement("button");
+  backButton.className = "back-button";
+  backButton.textContent = "← Back to all runs";
+  backButton.addEventListener("click", () => {
+    state.view = "home";
+    state.expandedId = null;
+    state.currentRunId = null;
+    state.currentPlan = null;
+    state.plannerChatMessages = [];
+    window.history.pushState({}, "", "/");
+    renderShell();
+    paintRuns();
   });
-
+  mainContent.appendChild(backButton);
+  
   const notice = document.createElement("p");
   notice.id = "notice";
   notice.className = "notice";
   notice.hidden = true;
-
-  const section = document.createElement("section");
-  section.className = "section";
-  const runsHeading = document.createElement("h2");
-  runsHeading.textContent = "Testing Runs";
-  const list = document.createElement("div");
-  list.id = "testing-runs";
-  section.append(runsHeading, list);
-  mainContent.append(form, notice, section);
+  mainContent.appendChild(notice);
+  
+  // Specification tile (highlighted)
+  const specSection = document.createElement("section");
+  specSection.className = "section";
+  const specCard = document.createElement("div");
+  specCard.className = "card spec-highlight";
+  const specHeading = document.createElement("h2");
+  specHeading.textContent = "Testing Request";
+  const specContent = document.createElement("div");
+  specContent.id = "spec-content";
+  specCard.append(specHeading, specContent);
+  specSection.appendChild(specCard);
+  mainContent.appendChild(specSection);
+  
+  // Plan section
+  const planSection = document.createElement("section");
+  planSection.className = "section";
+  planSection.id = "plan-section";
+  mainContent.appendChild(planSection);
+  
+  // Steps section
+  const stepsSection = document.createElement("section");
+  stepsSection.className = "section";
+  const stepsHeading = document.createElement("h2");
+  stepsHeading.textContent = "Test Steps";
+  const stepsList = document.createElement("div");
+  stepsList.id = "test-steps";
+  stepsSection.append(stepsHeading, stepsList);
+  mainContent.appendChild(stepsSection);
   
   mainLayout.append(sidebar, mainContent);
   app.append(mainLayout);
@@ -205,13 +299,19 @@ function renderShell() {
   });
   app.prepend(sidebarToggle);
   
+  // Remove old click handler if exists
+  if (state.sidebarClickHandler) {
+    document.removeEventListener("click", state.sidebarClickHandler);
+  }
+  
   // Add click outside to close sidebar (attach to document to catch all clicks)
-  document.addEventListener("click", (e) => {
+  state.sidebarClickHandler = (e) => {
     if (state.plannerChatOpen && !sidebar.contains(e.target) && !sidebarToggle.contains(e.target)) {
       state.plannerChatOpen = false;
       sidebar.classList.remove("open");
     }
-  });
+  };
+  document.addEventListener("click", state.sidebarClickHandler);
 }
 
 function paintChrome() {
@@ -411,6 +511,8 @@ function stepDetails(step, detailed) {
 
 function paintRuns() {
   const list = document.querySelector("#testing-runs");
+  if (!list) return;
+  
   list.replaceChildren();
   if (!state.runs.length) {
     const empty = document.createElement("p");
@@ -427,7 +529,6 @@ function paintRuns() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "run-toggle";
-    button.setAttribute("aria-expanded", String(state.expandedId === run.id));
     const id = document.createElement("span");
     id.className = "run-id";
     id.textContent = run.id;
@@ -436,14 +537,64 @@ function paintRuns() {
     status.className = `status ${statusClass(label)}`;
     status.textContent = label;
     button.append(id, status);
-    button.addEventListener("click", () => toggleRun(run.id));
+    button.addEventListener("click", () => openRun(run.id));
     block.append(button);
-    if (state.expandedId === run.id) {
-      block.append(runPanel(run));
-    }
     items.append(block);
   }
   list.append(items);
+}
+
+function paintRunDetails() {
+  const run = state.runs.find((item) => item.id === state.currentRunId);
+  if (!run) return;
+  
+  // Populate specification tile
+  const specContent = document.querySelector("#spec-content");
+  if (specContent) {
+    const specText = (run.report && run.report.specification) || run.specification;
+    if (specText) {
+      specContent.textContent = specText;
+    } else {
+      specContent.textContent = "No specification available";
+    }
+  }
+  
+  const stepsList = document.querySelector("#test-steps");
+  if (!stepsList) return;
+  
+  stepsList.replaceChildren();
+  
+  // Show reason if present
+  if (run.report && run.report.reason) {
+    const reason = document.createElement("p");
+    reason.className = "reason";
+    reason.textContent = run.report.reason;
+    stepsList.appendChild(reason);
+  }
+  
+  // Show missing capabilities if present
+  if (run.report && run.report.reason_code === "missing_capability") {
+    const missing = document.createElement("p");
+    missing.className = "summary";
+    missing.textContent = `Missing: ${(run.report.missing || []).join(", ")}`;
+    stepsList.appendChild(missing);
+  }
+  
+  // Show steps
+  const detailed = isSuccessOrFailure(run);
+  const steps = document.createElement("ol");
+  steps.className = "steps";
+  for (const step of run.steps || []) {
+    steps.append(stepDetails(step, detailed));
+  }
+  if ((run.steps || []).length) {
+    stepsList.appendChild(steps);
+  } else if (!run.ready) {
+    const waiting = document.createElement("p");
+    waiting.className = "summary";
+    waiting.textContent = "Waiting for the first step.";
+    stepsList.appendChild(waiting);
+  }
 }
 
 function runPanel(run) {
@@ -505,17 +656,22 @@ function upsertRun(snapshot) {
   } else {
     state.runs[index] = snapshot;
   }
-  paintRuns();
+  
+  if (state.view === "home") {
+    paintRuns();
+  }
+  
   if (snapshot.id !== state.currentRunId) {
     return;
   }
+  
   if (snapshot.plan) {
     state.currentPlan = snapshot.plan;
     renderPlan();
-    return;
   }
-  if (state.currentPlan) {
-    loadPlan(snapshot.id);
+  
+  if (state.view === "run-detail") {
+    paintRunDetails();
   }
 }
 
@@ -523,27 +679,17 @@ function toggleRun(id) {
   if (state.busy) {
     return;
   }
-  if (state.expandedId === id) {
-    state.expandedId = null;
-    window.history.pushState({}, "", "/");
-    paintRuns();
-    return;
-  }
   openRun(id);
 }
 
 async function openRun(id) {
+  state.view = "run-detail";
   state.expandedId = id;
   state.currentRunId = id;
   state.currentPlan = null;
   state.plannerChatMessages = [];
   // Don't auto-open chat panel on page refresh or run open
   state.plannerChatOpen = false;
-  // Ensure sidebar is closed
-  const sidebar = document.querySelector("#planner-sidebar");
-  if (sidebar) {
-    sidebar.classList.remove("open");
-  }
   window.history.pushState({}, "", `/runs/${id}`);
   const response = await fetch(`/v1/runs/${id}`);
   if (response.ok) {
@@ -555,7 +701,10 @@ async function openRun(id) {
   if (executing(run)) {
     watchRun(id);
   }
-  paintRuns();
+  renderShell();
+  renderPlan();
+  paintRunDetails();
+  renderChatMessages();
 }
 
 function watchRun(id) {
@@ -568,6 +717,11 @@ function watchRun(id) {
   source.onmessage = (event) => {
     const snapshot = JSON.parse(event.data);
     upsertRun(snapshot);
+    
+    // Reload plan if status changed and we're in detail view
+    if (state.view === "run-detail" && state.currentRunId === id) {
+      loadPlan(id);
+    }
 
     if (snapshot.ready) {
       finished = true;
@@ -608,24 +762,8 @@ async function submitSpecification(area, button) {
     area.value = "";
     state.notice = `Plan ready for ${body.id}`;
     paintChrome();
-    // Open chat panel after successful plan creation
-    state.plannerChatOpen = true;
-    const sidebar = document.querySelector("#planner-sidebar");
-    if (sidebar) {
-      sidebar.classList.add("open");
-    }
-    // Open run without auto-opening chat panel
-    state.expandedId = body.id;
-    state.currentRunId = body.id;
-    state.currentPlan = null;
-    state.plannerChatMessages = [];
-    window.history.pushState({}, "", `/runs/${body.id}`);
-    const response2 = await fetch(`/v1/runs/${body.id}`);
-    if (response2.ok) {
-      upsertRun(await response2.json());
-    }
-    await loadPlan(body.id);
-    await loadChatHistory(body.id);
+    // Navigate to run detail page
+    await openRun(body.id);
   } finally {
     button.disabled = false;
     setBusy(false);
@@ -824,6 +962,7 @@ async function approvePlan() {
     }
     state.currentPlan = body;
     await refreshSelectedRun();
+    paintRunDetails();
     watchRun(state.currentRunId);
     renderPlan();
   } catch (error) {
@@ -879,6 +1018,7 @@ async function rerunPlan() {
       return;
     }
     upsertRun(body);
+    paintRunDetails();
     watchRun(state.currentRunId);
     renderPlan();
   } catch (error) {
@@ -931,14 +1071,16 @@ async function downloadPlan(format) {
 
 async function boot() {
   await loadCapabilities();
-  renderShell();
   const response = await fetch("/v1/runs");
   const body = await response.json();
   state.runs = body.runs || [];
   const match = window.location.pathname.match(/^\/runs\/([^/]+)$/);
   if (match) {
+    state.view = "run-detail";
     await openRun(decodeURIComponent(match[1]));
   } else {
+    state.view = "home";
+    renderShell();
     paintRuns();
   }
   for (const run of state.runs) {
@@ -949,10 +1091,15 @@ async function boot() {
   window.addEventListener("popstate", () => {
     const next = window.location.pathname.match(/^\/runs\/([^/]+)$/);
     if (next) {
+      state.view = "run-detail";
       openRun(decodeURIComponent(next[1]));
     } else {
+      state.view = "home";
       state.expandedId = null;
-      paintRuns();
+      state.currentRunId = null;
+      state.currentPlan = null;
+      state.plannerChatMessages = [];
+      renderShell();
     }
   });
 }

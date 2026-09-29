@@ -41,6 +41,47 @@ body {
   overflow-y: auto;
 }
 
+.main-content.home {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 24px 0 48px;
+}
+
+.back-button {
+  background: var(--muted);
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
+.back-button:hover {
+  background: #4a5666;
+}
+
+.spec-highlight {
+  background: linear-gradient(135deg, #e7f6f2 0%, #d4efe8 100%);
+  border: 2px solid #b7e0d6;
+  box-shadow: 0 4px 12px rgba(11, 107, 98, 0.1);
+}
+
+.spec-highlight h2 {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.spec-highlight #spec-content {
+  white-space: pre-wrap;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--ink);
+  padding: 8px 0;
+}
+
 /* Sidebar */
 .sidebar {
   width: 400px;
@@ -506,6 +547,10 @@ ol.steps li {
 .status.failed, .status.rejected { background: #fdecee; color: var(--fail); }
 .status.error { background: #fff1e4; color: var(--error); }
 .status.running, .status.retrying, .status.working { background: #fff6df; color: var(--wait); }
+.status.submitted { background: #e3f2fd; color: #1976d2; }
+.status.pending { background: #f3e5f5; color: #7b1fa2; }
+.status.completed { background: #e8f5e9; color: #2e7d32; }
+.status.canceled { background: #eceff1; color: #607d8b; }
 
 .run-panel { padding: 0 14px 14px; }
 .run-panel .banner { margin-top: 0; }
