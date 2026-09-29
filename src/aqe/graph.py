@@ -22,7 +22,7 @@ from aqe.config import EngineConfig
 from aqe.state import PlanResult
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
-from aqe.judge import PageJudge, build_judge
+from aqe.judge import PageJudge, build_judge, literal_cli_match
 from aqe.llm import Planner, _PLAN_UNAVAILABLE, _coding_operations_from
 from aqe.state import (
     ActionResult,
@@ -424,6 +424,9 @@ def _cli_verification(deps: GraphDeps, question: str, result: ActionResult, evid
     exit_code = _cli_exit_code(result, evidence)
     stdout = str(evidence.get("stdout") or "")
     stderr = str(evidence.get("stderr") or "")
+    literal = literal_cli_match(question, exit_code, stdout, stderr)
+    if literal is not None:
+        return literal
     script_result = str(evidence.get("script_result") or "")
     work_dir_str = str(deps.work_dir) if deps.work_dir else ""
     judge = deps.judge

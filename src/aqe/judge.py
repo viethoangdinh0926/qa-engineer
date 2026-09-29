@@ -24,6 +24,52 @@ def mentions_stdout(question: str) -> bool:
     return _STDOUT_TERMS.search(question) is not None
 
 
+_QUOTED_TEXT = re.compile(r'["“]([^"”]{3,})["”]')
+_NEGATED_CHECK = re.compile(r"\b(?:does not|do not|must not|should not|without)\b", re.IGNORECASE)
+_EXPECTED_EXIT = re.compile(
+    r"(?:\$\?|exit code|exits with status)\s*(?:is|equals|=|:)?\s*(\d+)",
+    re.IGNORECASE,
+)
+_NOT_A_SNIPPET = frozenset({"stdout", "stderr", "standard output", "standard error"})
+
+
+def literal_cli_match(question: str, exit_code: int, stdout: str, stderr: str) -> Judgment | None:
+    """Pass a CLI check when every quoted phrase is already in the named stream.
+
+    A small model can miss text that is visibly present, such as
+    '[INFO] Health check succeeded' when the check asks for 'Health check succeeded'.
+    """
+    if _NEGATED_CHECK.search(question):
+        return None
+    snippets = [
+        text
+        for text in _QUOTED_TEXT.findall(question)
+        if text.strip().lower() not in _NOT_A_SNIPPET
+    ]
+    if not snippets:
+        return None
+    lowered = question.lower()
+    if "stderr" in lowered and "stdout" not in lowered:
+        haystack = stderr
+        stream = "stderr"
+    elif "stdout" in lowered and "stderr" not in lowered:
+        haystack = stdout
+        stream = "stdout"
+    else:
+        haystack = f"{stdout}\n{stderr}"
+        stream = "stdout"
+    if not all(snippet in haystack for snippet in snippets):
+        return None
+    expected = _EXPECTED_EXIT.search(question)
+    if expected is not None and int(expected.group(1)) != exit_code:
+        return None
+    shown = " and ".join(f'"{snippet}"' for snippet in snippets)
+    return Judgment(
+        passed=True,
+        judgment=f"$? is {exit_code} and {stream} contains {shown}.",
+    )
+
+
 _JUDGE_SYSTEM = (
     "You judge whether the supplied text satisfies one verification question. "
     "The text may be an HTML page, the command streams the verification asks about, "

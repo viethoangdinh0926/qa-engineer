@@ -283,6 +283,74 @@ def test_a_cli_verification_includes_the_exit_code() -> None:
     assert "$? is 1" in update["reason"]
 
 
+def test_stdout_log_lines_satisfy_a_quoted_check() -> None:
+    from aqe.graph import validate_node
+    from aqe.judge import Judgment
+    from aqe.state import ActionResult, StepView, TestStep
+
+    class Judge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def judge(self, question: str, text: str) -> Judgment:
+            del question, text
+            self.calls += 1
+            return Judgment(passed=False, judgment="stdout does not contain the required messages")
+
+        def judge_cli(self, question: str, exit_code: int, stdout: str, stderr: str, **kwargs: object) -> Judgment:
+            del question, exit_code, stdout, stderr, kwargs
+            self.calls += 1
+            return Judgment(passed=False, judgment="stdout does not contain the required messages")
+
+    question = (
+        '$? is 0 and stdout contains "Health check succeeded" and "Cleanup completed successfully".'
+    )
+    step = TestStep(
+        step=1,
+        interface="CLI",
+        action="Check health and clean up",
+        assertion=question,
+        verifications=[question],
+        script="echo '[INFO] Health check succeeded'\necho '[INFO] Cleanup completed successfully'\n",
+    )
+    judge = Judge()
+    deps = type(
+        "Deps",
+        (),
+        {
+            "planner": object(),
+            "judge": judge,
+            "work_dir": None,
+            "control": type("Control", (), {"cancel_requested": False})(),
+        },
+    )()
+    result = ActionResult(
+        ok=True,
+        summary="[INFO] Health check succeeded",
+        evidence={
+            "stdout": "[INFO] Health check succeeded\n[INFO] Cleanup completed successfully\n",
+            "stderr": "",
+            "exit_code": 0,
+        },
+    )
+    update = validate_node(
+        {
+            "current_step": 0,
+            "max_retries": 0,
+            "test_matrix": [step.model_dump()],
+            "step_views": [StepView.from_step(step).model_dump()],
+            "last_result": result.model_dump(),
+            "execution_history": [],
+            "attempt_counts": {},
+        },
+        deps,
+    )
+    assert judge.calls == 0
+    assert update["phase"] == "route"
+    assert update["step_views"][0]["assertion_passed"] is True
+    assert "Health check succeeded" in update["step_views"][0]["verification_results"][0]["judgment"]
+
+
 def test_a_zero_exit_is_judged_from_stdout_and_stderr() -> None:
     from aqe.graph import validate_node
     from aqe.judge import Judgment
