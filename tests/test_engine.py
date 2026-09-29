@@ -254,7 +254,7 @@ def test_a_cli_verification_includes_the_exit_code() -> None:
         script="pip install -r requirements.txt\n",
     )
     judge = Judge()
-    deps = type("Deps", (), {"planner": object(), "judge": judge, "work_dir": None})()
+    deps = type("Deps", (), {"planner": object(), "judge": judge, "work_dir": None, "control": type("Control", (), {"cancel_requested": False})()})()
     result = ActionResult(
         ok=False,
         summary="Bash script executed.",
@@ -305,7 +305,7 @@ def test_a_zero_exit_is_judged_from_stdout_and_stderr() -> None:
         script="python3 -m venv venv\nsource venv/bin/activate\n",
     )
     judge = Judge()
-    deps = type("Deps", (), {"planner": object(), "judge": judge})()
+    deps = type("Deps", (), {"planner": object(), "judge": judge, "work_dir": None, "control": type("Control", (), {"cancel_requested": False})()})()
 
     result = ActionResult(
         ok=True,
@@ -352,7 +352,18 @@ def test_a_cli_verification_runs_the_model_command(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls: list[tuple[str, int, str, str, bool]] = []
 
-        def judge_cli(self, question: str, exit_code: int, stdout: str, stderr: str, *, follow_up: bool = False) -> CliCheck:
+        def judge_cli(
+            self,
+            question: str,
+            exit_code: int,
+            stdout: str,
+            stderr: str,
+            *,
+            follow_up: bool = False,
+            script_result: str = "",
+            work_dir: str = "",
+        ) -> CliCheck:
+            del script_result, work_dir
             self.calls.append((question, exit_code, stdout, stderr, follow_up))
             if not follow_up:
                 return CliCheck(
@@ -371,7 +382,7 @@ def test_a_cli_verification_runs_the_model_command(tmp_path: Path) -> None:
         script="python app.py > service.log 2>&1 &\n",
     )
     judge = Judge()
-    deps = type("Deps", (), {"planner": object(), "judge": judge, "work_dir": work})()
+    deps = type("Deps", (), {"planner": object(), "judge": judge, "work_dir": work, "control": type("Control", (), {"cancel_requested": False})()})()
     result = ActionResult(
         ok=True,
         summary="Bash script executed.",

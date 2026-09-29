@@ -128,6 +128,175 @@ def test_plan_without_accepted_is_accepted_when_steps_exist() -> None:
     assert [op.action for op in result.steps[0].operations] == ["goto", "type", "click"]
 
 
+def test_plan_json_repair_stops_at_the_configured_retry_count() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+    from aqe.state import TestPhase, TestStep
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, messages: list) -> AIMessage:
+            del messages
+            self.calls += 1
+            return AIMessage(content='{"accepted": true, "phases": [')
+
+    model = Reply()
+    result = ChatModelPlanner(model, "http://127.0.0.1:8765", max_retries=2).plan("register ada")
+    assert model.calls == 2
+    assert result.accepted is False
+
+    phase = TestPhase(
+        phase=1,
+        name="Install",
+        interface="CLI",
+        operation_notes=["pip install flask"],
+        verifications=["Flask is installed."],
+    )
+    step = TestStep(
+        step=1,
+        interface="CLI",
+        action="pip install flask",
+        assertion="Flask is installed.",
+        verifications=["Flask is installed."],
+        operation_notes=["pip install flask"],
+    )
+    updater = Reply()
+    phases, _, reasoning = ChatModelPlanner(updater, "http://127.0.0.1:8765", max_retries=1).refine_plan(
+        [phase], [step], "Use a virtual environment.", []
+    )
+    assert updater.calls == 1
+    assert phases == [phase]
+    assert reasoning == "The planner could not update the test plan. Please try that request again."
+
+
+def test_a_long_broken_reply_is_truncated_in_the_fix_request() -> None:
+    from aqe.llm import _plan_json_fix
+
+    request = _plan_json_fix("x" * 5000, "The reply has no phases array.", "register ada")
+    assert "x" * 4000 in request
+    assert "x" * 4001 not in request
+    assert "[truncated]" in request
+    assert "phases array" in request
+
+
+def test_a_parser_error_is_not_shown_to_the_user() -> None:
+    from aqe.llm import _PLAN_UNAVAILABLE, _user_facing_reason
+
+    reason = _user_facing_reason(
+        "Expecting ':' delimiter (line 10 column 219)",
+        _PLAN_UNAVAILABLE,
+    )
+    assert reason == _PLAN_UNAVAILABLE
+    assert "Expecting" not in reason
+    assert "delimiter" not in reason
+
+
+def test_an_unparsed_plan_is_requested_three_times() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.queries: list[str] = []
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            self.queries.append(messages[-1].content)
+            return AIMessage(content='{"accepted": true, "phases": [')
+
+    model = Reply()
+    result = ChatModelPlanner(model, "http://127.0.0.1:8765").plan("register ada")
+    assert model.calls == 3
+    assert model.queries[0] == "register ada"
+    assert "Original request:\nregister ada" in model.queries[1]
+    assert '{"accepted": true, "phases": [' in model.queries[1]
+    assert "Error:" in model.queries[1]
+    assert "Fix that JSON" in model.queries[1]
+    assert model.queries[2] == model.queries[1]
+    assert result.accepted is False
+    assert result.reason == (
+        "The planner could not produce a test plan from that request. "
+        "Please try submitting it again."
+    )
+    assert "Expecting" not in (result.reason or "")
+    assert "schema" not in (result.reason or "")
+
+
+def test_a_json_reply_without_phases_is_sent_back() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+
+    valid = (
+        '{"accepted": true, "reason": null, "phases": [{"phase": 1, "name": "Register", '
+        '"depends_on": [], "interface": "GUI", "gui_driver": "browser", "operations": ['
+        '{"action": "goto", "text": "http://127.0.0.1:8765"}], '
+        '"verifications": ["The page contains registered"]}]}'
+    )
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.queries: list[str] = []
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            self.queries.append(messages[-1].content)
+            if self.calls == 1:
+                return AIMessage(content='{"accepted": true, "phases": [')
+            if self.calls == 2:
+                return AIMessage(content='{"accepted": true, "reason": null}')
+            return AIMessage(content=valid)
+
+    model = Reply()
+    result = ChatModelPlanner(model, "http://127.0.0.1:8765").plan("register ada")
+    assert model.calls == 3
+    assert "The reply has no phases array." in model.queries[2]
+    assert '{"accepted": true, "reason": null}' in model.queries[2]
+    assert result.accepted
+    assert result.phases[0].name == "Register"
+
+
+def test_a_later_plan_reply_is_used_when_the_first_is_not_json() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+
+    valid = (
+        '{"accepted": true, "reason": null, "phases": [{"phase": 1, "name": "Register", '
+        '"depends_on": [], "interface": "GUI", "gui_driver": "browser", "operations": ['
+        '{"action": "goto", "text": "http://127.0.0.1:8765"}], '
+        '"verifications": ["The page contains registered"]}]}'
+    )
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.queries: list[str] = []
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            self.queries.append(messages[-1].content)
+            if self.calls < 3:
+                return AIMessage(content="not json")
+            return AIMessage(content=valid)
+
+    model = Reply()
+    result = ChatModelPlanner(model, "http://127.0.0.1:8765").plan("register ada")
+    assert model.calls == 3
+    assert "Original request:\nregister ada" in model.queries[1]
+    assert "not json" in model.queries[1]
+    assert "Broken reply:" in model.queries[1]
+    assert "Error:" in model.queries[1]
+    assert result.accepted
+    assert result.phases[0].name == "Register"
+
+
 def test_plan_coerces_string_steps_and_action_objects() -> None:
     from langchain_core.messages import AIMessage
 
@@ -1274,10 +1443,14 @@ def test_prose_plan_reply_is_sent_back_for_valid_json() -> None:
     phases, _, reasoning = ChatModelPlanner(model, "http://127.0.0.1:8765").refine_plan(
         current, steps, "Use a virtual environment.", []
     )
-    assert model.calls == 1
+    assert model.calls == 3
     assert "not valid JSON" not in model.queries[0]
+    assert "Original request:\nUse a virtual environment." in model.queries[1]
+    assert "Phase 2 will be a command line phase" in model.queries[1]
+    assert "Error:" in model.queries[1]
+    assert "Fix that JSON" in model.queries[1]
     assert phases == current
-    assert reasoning.startswith("Failed to refine plan:")
+    assert reasoning == "The planner could not update the test plan. Please try that request again."
 
 
 def test_unparsed_json_is_requested_three_times() -> None:
@@ -1319,9 +1492,14 @@ def test_unparsed_json_is_requested_three_times() -> None:
     phases, _, reasoning = ChatModelPlanner(model, "http://127.0.0.1:8765").refine_plan(
         current, steps, "Use a virtual environment.", []
     )
-    assert model.calls == 1
+    assert model.calls == 3
+    assert "Original request:\nUse a virtual environment." in model.queries[1]
+    assert "Create a virtual environment before installing." in model.queries[1]
+    assert "Error:" in model.queries[1]
+    assert "Fix that JSON" in model.queries[1]
+    assert model.queries[0].startswith("User feedback:")
     assert phases == current
-    assert reasoning.startswith("Failed to refine plan:")
+    assert reasoning == "The planner could not update the test plan. Please try that request again."
 
 
 def test_decimal_phase_number_is_inserted_in_order() -> None:
@@ -1385,6 +1563,54 @@ def test_decimal_phase_number_is_inserted_in_order() -> None:
     ]
     assert phases[1].operation_notes == ["pip install flask"]
     assert phases[2].depends_on == [2]
+
+
+def test_a_phase_without_an_interface_is_placed_from_its_script() -> None:
+    from aqe.llm import _coerce_phases
+
+    phases, problem = _coerce_phases(
+        [
+            {"phase": 1, "name": "Find Free Port", "script": "python3 -c 'print(8080)'\n"},
+            {"phase": 2, "name": "Open the form", "Interface": "command line", "commands": ["curl http://127.0.0.1:8080"]},
+        ]
+    )
+    assert problem is None
+    assert [phase.interface for phase in phases] == ["CLI", "CLI"]
+    assert "print(8080)" in phases[0].script
+
+
+def test_a_plan_without_interfaces_is_sent_back() -> None:
+    from langchain_core.messages import AIMessage
+
+    from aqe.llm import ChatModelPlanner
+
+    valid = (
+        '{"accepted": true, "reason": null, "phases": [{"phase": 1, "name": "Find Free Port", '
+        '"interface": "CLI", "script": "python3 -c \'print(8080)\'\\n", '
+        '"verifications": ["$? is 0 and stdout is 8080."]}]}'
+    )
+
+    class Reply:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.queries: list[str] = []
+
+        def invoke(self, messages: list) -> AIMessage:
+            self.calls += 1
+            self.queries.append(messages[-1].content)
+            if self.calls == 1:
+                return AIMessage(
+                    content='{"accepted": true, "phases": [{"phase": 1, "name": "Find Free Port"}]}'
+                )
+            return AIMessage(content=valid)
+
+    model = Reply()
+    result = ChatModelPlanner(model, "http://127.0.0.1:8765", max_retries=2).plan("find a free port")
+    assert model.calls == 2
+    assert "driver is unknown" in model.queries[1]
+    assert "Original request:\nfind a free port" in model.queries[1]
+    assert result.accepted
+    assert result.phases[0].interface == "CLI"
 
 
 def test_cli_phase_keeps_the_bash_script() -> None:

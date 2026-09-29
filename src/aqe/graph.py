@@ -23,7 +23,7 @@ from aqe.state import PlanResult
 from aqe.errors import HarnessError
 from aqe.gui.subsystem import GUISubsystem
 from aqe.judge import PageJudge, build_judge
-from aqe.llm import Planner, _coding_operations_from
+from aqe.llm import Planner, _PLAN_UNAVAILABLE, _coding_operations_from
 from aqe.state import (
     ActionResult,
     AgentState,
@@ -146,12 +146,11 @@ def plan_node(state: AgentState, deps: GraphDeps) -> dict:
             # Generate a new plan
             result = deps.planner.plan(state["specification"])
     except Exception as exc:  # noqa: BLE001 - bad planner output rejects the run
-        import traceback
-        logger.error(f"Planner failed: {exc}\n{traceback.format_exc()}")
+        logger.warning("Planner failed: %s", exc)
         return {
             "phase": "finish",
             "reason_code": "not_a_test_plan",
-            "reason": f"planner output did not match the test plan schema: {exc}",
+            "reason": _PLAN_UNAVAILABLE,
             "step_views": [],
             "test_matrix": [],
         }

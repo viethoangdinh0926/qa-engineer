@@ -19,7 +19,7 @@ from aqe.errors import AgentBusyError, SpecValidationError
 from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
 from aqe.gui.subsystem import GUISubsystem, build_gui
 from aqe.judge import PageJudge
-from aqe.llm import Planner, build_planner
+from aqe.llm import Planner, _PLAN_UNAVAILABLE, build_planner
 from aqe.plan_storage import PlanStorageManager
 from aqe.state import AgentState, PlanStorage, PlannerChatHistory, TERMINAL_STATUSES, status_for_verdict
 
@@ -88,10 +88,8 @@ class RunService:
             try:
                 plan_result = planner.plan(specification)
             except Exception as exc:  # noqa: BLE001 - a planner crash is a rejected run
-                self._finish_rejected(
-                    record,
-                    f"planner output did not match the test plan schema: {exc}",
-                )
+                logger.warning("Planner failed: %s", exc)
+                self._finish_rejected(record, _PLAN_UNAVAILABLE)
                 return self.snapshot(record)
             if not plan_result.accepted:
                 self._finish_rejected(

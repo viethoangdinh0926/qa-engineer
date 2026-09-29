@@ -29,6 +29,27 @@ def invoke_json(model: BaseChatModel, messages: list, parser: Callable[[str], T]
         logger.warning("Model reply was not valid JSON: %s", exc)
         raise ValueError(str(exc)) from exc
 
+
+_BROKEN_REPLY_LIMIT = 4000
+
+
+def _plan_json_fix(broken: str, error: str, query: str) -> str:
+    """Ask the model to repair the plan reply it just returned."""
+    reply = broken
+    if len(reply) > _BROKEN_REPLY_LIMIT:
+        reply = reply[:_BROKEN_REPLY_LIMIT] + "\n...[truncated]"
+    return (
+        "Original request:\n"
+        f"{query}\n\n"
+        "The previous reply cannot be used as the test plan.\n\n"
+        f"Error:\n{error}\n\n"
+        "Broken reply:\n"
+        f"{reply}\n\n"
+        "Fix that JSON and return one valid JSON object for the original request. "
+        "The object must include a phases array. "
+        "Return nothing else."
+    )
+
 NONSENSE_SPEC = "Hello, this is not a test specification."
 
 _STEP_LINE = re.compile(
@@ -36,6 +57,28 @@ _STEP_LINE = re.compile(
     re.IGNORECASE,
 )
 _ASSERTION_LINE = re.compile(r"^assertion\s*:\s*(.+)$", re.IGNORECASE)
+
+
+_PLAN_UNAVAILABLE = (
+    "The planner could not produce a test plan from that request. "
+    "Please try submitting it again."
+)
+_PLAN_UPDATE_UNAVAILABLE = (
+    "The planner could not update the test plan. Please try that request again."
+)
+_CODE_ERROR = re.compile(
+    r"expecting ['\"]|delimiter|did not match the test plan schema|traceback|"
+    r"jsondecode|validationerror|pydantic|line \d+ column \d+",
+    re.IGNORECASE,
+)
+
+
+def _user_facing_reason(text: str | None, fallback: str) -> str:
+    """Hide parser and schema errors. Keep a reason a person can act on."""
+    cleaned = (text or "").strip()
+    if not cleaned or _CODE_ERROR.search(cleaned):
+        return fallback
+    return cleaned
 
 
 def _reject(reason: str) -> PlanResult:
@@ -122,310 +165,426 @@ class Planner(Protocol):
         """Refine the plan based on user feedback. Returns (phases, steps, reasoning)."""
 
 
-_AGENT_CAPABILITIES = (
-    "IMPORTANT: The agent runs with ROOT privileges. NEVER use sudo in any CLI command. "
-    "The agent can use three capabilities: a web browser (open a page, type into a field, click a button, press a key), "
-    "host CLI tools (shell commands), and a Pi coding agent that generates code and files. "
-    "A request to generate, write, or create source code or files, or a request for a CODING phase, "
-    "is a CODING phase. The Pi coding agent runs it through coding_operations "
-    "(create_file, update_file, or review_code), each with file_path, content, and description. "
-    "Do not turn that request into a CLI command such as cat, tee, or python -c. "
-    "The host CLI can start a process and call a network endpoint, including curl against a local health URL. "
-    "A request to create an API or service and verify that it is running is accepted. "
-    "Generate the source in a CODING phase. "
-    "Start the process in the background and run the health check in a later CLI phase that depends on the CODING phase. "
-    "Do not reject that request because the generated code must be executed, a server must be started, or a live endpoint must be called. "
-    "If the request cannot be tested with the browser, CLI tools, or the Pi coding agent, "
-    "set accepted to false and explain that mismatch in reason. "
-    "For CODING operations, file_path must be a relative path within the work directory (e.g., 'main.go', 'src/app.py'). "
-    "Do not use absolute paths (e.g., '/tmp/file.txt') or paths with '..'. The work directory is the execution context. "
-    "IMPORTANT: All generated files and code must be placed in the work directory. "
-    "For CLI phases, do not write to system directories like /tmp, /var, /etc, or home directories. "
-    "Use relative paths from the work directory for all file operations (e.g., './output.txt', 'results/data.json'). "
-    "The work directory is the current working directory for all CLI commands. "
-    "IMPORTANT: Add logging to bash scripts to help with debugging. Use 'echo' statements to log key steps, "
-    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2). "
-    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]'). "
-    "Example: 'echo \"[INFO] Starting service on port $PORT\"' (stdout) or 'echo \"[ERROR] Failed to connect to database\" >&2' (stderr). "
-    "This makes stdout/stderr more informative for debugging test failures. "
-    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use, "
-    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service. "
-    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &'). "
-    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid'). "
-    "Do not wait for the service to finish - the phase should complete immediately after starting it. "
-    "Subsequent phases can then interact with the running service (e.g., curl health endpoint, check logs). "
-    "For CLI phases, do not assume any CLI tool is pre-installed. Before using a tool (e.g., lsof, jq, go, python3), "
-    "check if it exists with 'command -v tool' or 'which tool', and install it if missing using apt-get, pip, or the appropriate package manager. "
-    "Include both the check and installation commands in the script. "
-    "When creating a service that listens on a network port (HTTP server, API, etc.), do not hardcode a port number. "
-    "Instead, include a CLI phase before the CODING phase to find a free port using 'python3 -c \"import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()\"' "
-    "or similar, then pass that port to the CODING phase via the code content or use it in subsequent phases. "
-    "This avoids port conflicts with other services."
+def _section(*lines: str) -> str:
+    """Join prompt sentences into one paragraph."""
+    return " ".join(line.strip() for line in lines if line.strip())
+
+
+def _prompt(*sections: str) -> str:
+    """Join prompt sections with a blank line between them."""
+    return "\n\n".join(section.strip() for section in sections if section.strip())
+
+
+_ROOT_PRIVILEGE = _section(
+    "IMPORTANT: The agent runs with ROOT privileges. NEVER use sudo in any CLI command.",
 )
 
-_PLAN_SYSTEM = (
-    _AGENT_CAPABILITIES
-    + "You are the planner, not the executor. Another system will run the phases you write: "
-    "GUI phases in the browser, CLI phases with host CLI tools, and CODING phases with the Pi coding agent. "
-    "Do not reject a request because you cannot click, browse, read files, or write code yourself. "
-    "Turn the testing request into one linear pipeline of testing phases. "
-    "Reply with one JSON object only, with keys accepted, reason, and phases. "
-    "Each phase is a chain of operations followed by the verifications of those operations. "
-    "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty), "
-    "interface (GUI, CLI, or CODING), gui_driver (browser or null), operations, script, coding_operations, and verifications. "
-    "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed. "
-    "A GUI phase sets gui_driver to browser. "
-    "A CLI phase sets interface to CLI and puts the whole bash script in script. "
-    "script is one string the agent runs with bash. Include every command, in order, with newlines escaped as \\n. "
-    "Use set -e so a failing command stops the script. "
-    "IMPORTANT: Add logging to bash scripts to help with debugging. Use 'echo' statements to log key steps, "
-    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2). "
-    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]'). "
-    "Example: 'echo \"[INFO] Starting service on port $PORT\"' (stdout) or 'echo \"[ERROR] Failed to connect to database\" >&2' (stderr). "
-    "This makes stdout/stderr more informative for debugging test failures. "
-    "IMPORTANT: NEVER use sudo - the agent runs as root. "
-    "source, &&, and a trailing & belong in that script. Do not describe the commands in prose. "
-    "For CLI phases that use tools (lsof, jq, go, python3, etc.), always include a check and installation command in the script. "
-    "Check for tools with 'command -v tool' or 'which tool', then install if missing using apt-get, pip, or the appropriate package manager. "
-    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use, "
-    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service. "
-    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &'). "
-    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid'). "
-    "Do not wait for the service to finish - the phase should complete immediately after starting it. "
-    "Subsequent phases can then interact with the running service (e.g., curl health endpoint, check logs). "
-    "When creating a service that listens on a network port, first include a CLI phase to find a free port dynamically. "
-    "Use 'python3 -c \"import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()\"' to get a free port, "
-    "then pass that port to the CODING phase in the code content or use it in subsequent CLI phases. "
-    "CODING operations are objects with action create_file, update_file, or review_code, plus file_path, content, and description. "
-    "When the user asks for a CODING phase, or asks the agent to generate code or files, that phase uses interface CODING "
-    "and coding_operations. It does not use interface CLI. "
-    "GUI verifications are questions about the page after the operations. "
-    "A CLI verification is decided only from $? , stdout, and stderr after that phase's script runs. "
-    "The script must print the evidence the check needs. "
-    "Each CLI verification names what $? , stdout, or stderr must show, in one or two sentences. "
-    "Do not write a vague check such as 'the background service is running', "
-    "'the log is available for later inspection', 'a process is present', or 'the service is listening'. "
-    "If a service is started in the background, the same script must then print proof, for example by calling curl on the health URL. "
-    "The verification then says what that command produced, such as '$? is 0 and stdout is OK.' "
-    "CODING verifications are questions about the files the Pi coding agent wrote. "
-    "Name the file and what it should contain. "
-    "The check is judged from the file that was written, not from a message that the operation succeeded. "
-    "IMPORTANT: For CODING operations, add logging statements to the generated code to help with debugging. "
-    "Use print statements or logging libraries to log key steps, errors, and intermediate results. "
-    "Direct informational logs to stdout and error logs to stderr (using sys.stderr.write or logging.error). "
-    "Example: 'print(\"[INFO] Starting HTTP server on port $PORT\")' (stdout) or 'print(f\"[ERROR] Failed to connect: {e}\", file=sys.stderr)' (stderr). "
-    "This makes the code more debuggable when test failures occur. "
-    "Write every verification as one or two complete sentences. Be specific and verbose. "
-    "Keep the original meaning of the user's check. Do not add a condition they did not ask for, and do not drop one they did. "
-    "Do not shorten a check into contains:, json:, or status:. "
-    "If the user says a command returns nothing or mentions its output, say whether stdout is empty. "
-    "Express a CLI check as a claim about $? , stdout, or stderr that the script prints. "
-    "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr. "
-    "Example: 'Run ls. Verify that it returns nothing.' has verification "
-    "'The ls command returns nothing. stdout is empty. A successful exit code does not satisfy this check.' "
-    "Example: 'Run curl and verify that it reports an error.' has verification "
-    "'The curl command reports an error.' It does not mention stdout. "
-    "IMPORTANT: Never use environment variables ($VAR) in CLI operations. Use concrete values instead. "
-    "For example, instead of 'curl http://localhost:$PORT', use 'curl http://localhost:8080'. "
-    "Instead of 'docker port $container_id 5000', write a step that gets the actual container ID and uses it directly. "
-    "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for any test step. "
-    "All CLI operations must run directly in the host environment without containers. "
-    "Do not instruct the agent to start containers, use docker commands, or containerize any part of the test execution. "
-    "Every phase needs at least one verification. "
-    "Put a phase that needs another phase's result after that phase, and list it in depends_on. "
-    "One page visit is one GUI phase. Navigation, typing, and the click are that phase's operations. "
-    "The page check is a verification on that same phase, not a later phase. "
-    "A request to open a page, type into a named field, click a named button, and then check the page text "
-    "is accepted true as one GUI phase. It is not a contradiction. "
-    "Use the field name and button name from the request. "
-    'Example: open http://localhost:8765, type ada into Username, click Commit, and verify the page contains registered becomes '
-    '{"accepted": true, "reason": null, "phases": [{"phase": 1, "name": "Register ada", "depends_on": [], '
-    '"interface": "GUI", "gui_driver": "browser", "operations": ['
-    '{"action": "goto", "text": "http://localhost:8765"}, '
-    '{"action": "type", "selector": {"role": "textbox", "name": "Username"}, "text": "ada"}, '
-    '{"action": "click", "selector": {"role": "button", "name": "Commit"}}], '
-    '"verifications": ["The page contains registered"]}]} '
-    "Set accepted false only when the request itself is not a test, contradicts itself, "
-    "or asks for a check whose result nothing in the request produces. "
-    "When accepted is false, leave phases empty and explain that request problem in reason. "
-    "Do not reject because a page check comes after the click that produces the page."
+_CAPABILITIES = _section(
+    "The agent can use three capabilities: a web browser (open a page, type into a field, click a button, press a key),",
+    "host CLI tools (shell commands), and a Pi coding agent that generates code and files.",
+    "A request to generate, write, or create source code or files, or a request for a CODING phase,",
+    "is a CODING phase. The Pi coding agent runs it through coding_operations",
+    "(create_file, update_file, or review_code), each with file_path, content, and description.",
+    "Do not turn that request into a CLI command such as cat, tee, or python -c.",
+    "The host CLI can start a process and call a network endpoint, including curl against a local health URL.",
+    "A request to create an API or service and verify that it is running is accepted.",
+    "Generate the source in a CODING phase.",
+    "Start the process in the background and run the health check in a later CLI phase that depends on the CODING phase.",
+    "Do not reject that request because the generated code must be executed, a server must be started, or a live endpoint must be called.",
+    "If the request cannot be tested with the browser, CLI tools, or the Pi coding agent,",
+    "set accepted to false and explain that mismatch in reason.",
 )
 
-_REPAIR_SYSTEM = (
-    _AGENT_CAPABILITIES
-    + "Revise the testing plan so every phase is executable with the browser, a CLI command, or the Pi coding agent. "
-    "Keep a requested CODING phase as interface CODING with coding_operations. "
-    "Reply with one JSON object only, with keys accepted, reason, and phases. "
-    "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, script, coding_operations, and verifications. "
-    "A CLI phase must include script, the complete bash script. "
-    "A CLI verification is decided only from $? , stdout, and stderr. "
-    "The script must print the evidence, and the verification must say what $? , stdout, or stderr must show. "
-    "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'. "
-    "IMPORTANT: Add logging to bash scripts to help with debugging. Use 'echo' statements to log key steps, "
-    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2). "
-    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]'). "
-    "Example: 'echo \"[INFO] Starting service on port $PORT\"' (stdout) or 'echo \"[ERROR] Failed to connect to database\" >&2' (stderr). "
-    "This makes stdout/stderr more informative for debugging test failures. "
-    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use, "
-    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service. "
-    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &'). "
-    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid'). "
-    "Do not wait for the service to finish - the phase should complete immediately after starting it. "
-    "Subsequent phases can then interact with the running service (e.g., curl health endpoint, check logs). "
-    "verifications must be strings. "
-    "Every check the request asks for must appear as a verification written as one or two complete sentences. "
-    "Be verbose and keep the original meaning. Do not shorten a check into contains:, json:, or status:. "
-    "A command that should return nothing is described as empty stdout, not as an exit code. "
-    "Express a CLI check as a claim about $? , stdout, or stderr that the script prints. "
-    "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr. "
-    "A page check belongs on the GUI phase whose operations produce that page. Never make the check its own phase. "
-    "A file, webhook, or command check is a later CLI phase whose depends_on lists the phase that produced it. "
-    "Coding operations (create_file, update_file, review_code, execute_code) belong in CODING phases. "
-    "CODING operations ARE valid test operations. They are not 'development activities' to be rejected. "
-    "IMPORTANT: When a phase has interface CODING, you MUST include coding_operations with the actual file operations. "
-    "Do not create a CODING phase with only verifications and no coding_operations. "
-    "Keep phases in an order that respects those dependencies. "
-    "You are the planner, not the executor. Do not reject a request because you cannot browse, read files or write code. "
-    "Opening a page, typing into a named field, clicking a named button, and checking the resulting page "
-    "is one accepted GUI phase. Use those names in the selectors. "
-    "Phases without verifications are allowed for setup/preparation steps. "
-    "If all phases have no verifications, the test passes if all operations succeed. "
-    "Set accepted false only when the request itself is not a test or contradicts itself. "
-    "IMPORTANT: NEVER use sudo in any CLI script - the agent runs as root. "
-    "For CLI phases that use tools (lsof, jq, go, python3, etc.), always include a check and installation command in the script. "
-    "Check for tools with 'command -v tool' or 'which tool', then install if missing using apt-get, pip, or the appropriate package manager. "
-    "When creating a service that listens on a network port, first include a CLI phase to find a free port dynamically. "
-    "Use 'python3 -c \"import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()\"' to get a free port, "
-    "then pass that port to the CODING phase in the code content or use it in subsequent CLI phases."
+_WORK_DIRECTORY = _section(
+    "For CODING operations, file_path must be a relative path within the work directory (e.g., 'main.go', 'src/app.py').",
+    "Do not use absolute paths (e.g., '/tmp/file.txt') or paths with '..'. The work directory is the execution context.",
+    "IMPORTANT: All generated files and code must be placed in the work directory.",
+    "For CLI phases, do not write to system directories like /tmp, /var, /etc, or home directories.",
+    "Use relative paths from the work directory for all file operations (e.g., './output.txt', 'results/data.json').",
+    "The work directory is the current working directory for all CLI commands.",
 )
 
-_REJECT_SYSTEM = (
-    "Explain why this testing request itself cannot be planned. Plain sentences, not JSON. "
-    "Describe only a problem in the request: it is not a test, two requirements contradict each other, "
-    "or a check needs a result the request never produces. "
-    "CODING operations (create_file, update_file, review_code, execute_code) ARE valid test operations. "
-    "Do not reject a request just because it involves writing code or creating files. "
-    "Do not say the agent cannot start a server, execute generated code, or call a health endpoint. "
-    "Those steps are a CLI phase after the CODING phase that writes the service. "
-    "Do not call it a contradiction when the request opens a page, fills a field, clicks a button, "
-    "and then checks the page text. That is one GUI phase, with the check after the click. "
-    "Do not talk about a verification phase that has no operations."
+_BASH_LOGGING = _section(
+    "IMPORTANT: Add logging to bash scripts to help with debugging. Use 'echo' statements to log key steps,",
+    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2).",
+    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]').",
+    'Example: \'echo "[INFO] Starting service on port $PORT"\' (stdout) or \'echo "[ERROR] Failed to connect to database" >&2\' (stderr).',
+    "This makes stdout/stderr more informative for debugging test failures.",
 )
 
-_OPS_SYSTEM = (
-    "Reply with one JSON object only, no markdown. "
-    '{"operations": [{"step": 1, "operations": ['
-    '{"action": "goto", "text": "http://127.0.0.1:8765"}, '
-    '{"action": "type", "selector": {"role": "textbox", "name": "Username"}, "text": "ada"}, '
-    '{"action": "click", "selector": {"role": "button", "name": "Register"}}'
-    "]}]} "
-    "Include every control the phase names, including the submit click. "
-    "Use the field name and button name from the phase text. "
-    "If the phase says Username, the textbox name is Username. "
-    "If the phase says Commit, the button name is Commit. "
-    "Use the given target URL for goto."
+_SCRIPT_LOGGING = _section(
+    "IMPORTANT: Add logging to help with debugging. Use 'echo' statements or print statements to log key steps,",
+    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2 for bash, file=sys.stderr for Python).",
+    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]').",
+    'Example: \'echo "[INFO] Starting service on port $PORT"\' (stdout) or \'print("[ERROR] Failed to connect: {e}", file=sys.stderr)\' (stderr).',
+    "This makes stdout/stderr more informative for debugging test failures.",
 )
 
-_SCRIPT_SYSTEM = (
-    "Reply with Python only, no markdown and no functions. "
-    "Perform the operation in the user message and print its result to stdout. "
-    "Do not read /evidence unless the operation names a file there. "
-    "IMPORTANT: Always prefer direct CLI commands over Python scripts when possible. "
-    "Use common CLI tools like curl, wget, jq, grep, sed, awk, etc. "
-    "Only use Python scripts when the operation requires complex logic, loops, or data processing that CLI tools cannot handle. "
-    "IMPORTANT: Never use environment variables ($VAR) in commands. Use concrete values instead. "
-    "For example, instead of 'curl http://localhost:$PORT', use 'curl http://localhost:8080'. "
-    "Instead of 'docker port $container_id 5000', use the actual container ID. "
-    "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for any operation. "
-    "All commands must run directly in the host environment without containers. "
-    "IMPORTANT: Add logging to help with debugging. Use 'echo' statements or print statements to log key steps, "
-    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2 for bash, file=sys.stderr for Python). "
-    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]'). "
-    "Example: 'echo \"[INFO] Starting service on port $PORT\"' (stdout) or 'print(\"[ERROR] Failed to connect: {e}\", file=sys.stderr)' (stderr). "
-    "This makes stdout/stderr more informative for debugging test failures. "
-    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use, "
-    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service. "
-    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &'). "
-    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid'). "
-    "Do not wait for the service to finish - the phase should complete immediately after starting it."
+_CODING_LOGGING = _section(
+    "IMPORTANT: For CODING operations, add logging statements to the generated code to help with debugging.",
+    "Use print statements or logging libraries to log key steps, errors, and intermediate results.",
+    "Direct informational logs to stdout and error logs to stderr (using sys.stderr.write or logging.error).",
+    'Example: \'print("[INFO] Starting HTTP server on port $PORT")\' (stdout) or \'print(f"[ERROR] Failed to connect: {e}", file=sys.stderr)\' (stderr).',
+    "This makes the code more debuggable when test failures occur.",
 )
 
-_FIX_STEP_SYSTEM = (
-    "You are fixing a failed test step. "
-    "Review the failed step and the error message, then determine if this is a hard failure that cannot be fixed by retrying. "
-    "Hard failures include: "
-    "- Port conflicts (e.g., 'Address already in use', 'port is in use') "
-    "- Missing dependencies that cannot be installed (e.g., 'No module named X' when X is not available) "
-    "- Permission errors that cannot be resolved (e.g., 'Permission denied' for system files) "
-    "- Network errors indicating the service is not running on the expected port "
-    "- File not found errors for files that don't exist and cannot be created "
-    "- Service startup failures that indicate the service cannot run (e.g., 'ModuleNotFoundError' for required modules) "
-    "If the error is a hard failure, set should_retry to false and explain why in judgment, in one or two sentences. "
-    "If the error can be fixed, set should_retry to true and provide the corrected step. "
-    "The step is retried at most 3 times, and only when should_retry is true. "
-    "Reply with one JSON object only. "
-    "If should_retry is true, include the corrected step with these fields: step, interface, gui_driver, action, assertion, verifications, operations, script, coding_operations. "
-    "Keep the same step number and interface. "
-    "For a CLI step, script is the whole bash script to run. Replace that script to fix the failure. "
-    "Common fixes: "
-    "- If file not found: correct the file path or create the file first "
-    "- If command not found: use the correct command name or install the tool "
-    "- If permission denied: the agent runs as root, so permission should not be an issue - check the actual error "
-    "- If syntax error: fix the command syntax "
-    "- If timeout: add a longer timeout or break into smaller steps "
-    "- If dependency missing: add a step to install the dependency "
-    "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for the fix. "
-    "All operations must run directly in the host environment without containers. "
-    "IMPORTANT: Add logging to bash scripts to help with debugging. Use 'echo' statements to log key steps, "
-    "errors, and intermediate results. Direct informational logs to stdout and error logs to stderr (using >&2). "
-    "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]'). "
-    "Example: 'echo \"[INFO] Starting service on port $PORT\"' (stdout) or 'echo \"[ERROR] Failed to connect to database\" >&2' (stderr). "
-    "This makes stdout/stderr more informative for debugging test failures. "
-    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use, "
-    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service. "
-    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &'). "
-    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid'). "
-    "Do not wait for the service to finish - the phase should complete immediately after starting it. "
-    "Return JSON with keys: 'should_retry' (true or false), 'step' (the corrected step, only if should_retry is true), 'judgment' (explanation)."
+_BACKGROUND_SERVICE = _section(
+    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use,",
+    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service.",
+    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &').",
+    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid').",
+    "Do not wait for the service to finish - the phase should complete immediately after starting it.",
+    "Subsequent phases can then interact with the running service (e.g., curl health endpoint, check logs).",
 )
 
-_REFINE_PLAN_SYSTEM = (
-    _AGENT_CAPABILITIES
-    + "You are a test planning assistant. The user may ask a question about the current plan or ask you to change it. "
-    "Reply with one valid JSON object and nothing else. "
-    "Do not add prose, markdown, or a code fence around it. "
-    "Use double quotes for every key and string. "
-    "Escape quotation marks and newlines inside strings. "
-    "Do not use comments or trailing commas. "
-    "If the user asks a question, return "
-    '{"type": "answer", "answer": "the answer in sentences"}. '
-    "If the user asks to change the plan, return the complete plan that should exist after the change: "
-    '{"type": "plan_update", "reasoning": "one or two sentences", "phases": []}. '
-    "Each phase has phase, name, interface, depends_on, operation_notes, script, verifications, and coding_operations. "
-    "phase is a whole number: 1, then 2, then 3. Never use a decimal such as 1.5. "
-    "To insert a phase, renumber every later phase. "
-    "interface is GUI, CLI, or CODING. "
-    "A GUI phase sets gui_driver to browser. "
-    "A CLI phase sets script to the complete bash script, with newlines escaped as \\n. "
-    "Do not put the commands in prose. "
-    "A CLI verification names what $? , stdout, or stderr must show after the script runs. "
-    "The script must print that evidence. "
-    "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'. "
-    "Each CLI script starts a new shell. source does not carry into the next phase. "
-    "A later phase that needs the virtual environment must source it again at the start of its script, "
-    "or call venv/bin/pip and venv/bin/python. "
-    "The phases array is the complete plan after the change. "
-    "The agent stores that list as the plan. "
-    "Include every phase that should still run, with its script or its file content. "
-    "When the user asks to remove or merge phases, leave those phases out of the list and fix depends_on so every dependency is a phase in the list. "
-    "A CODING phase puts create_file, update_file, or review_code objects in coding_operations, "
-    "each with action, file_path, content, and description."
+_ENSURE_TOOLS = _section(
+    "For CLI phases, do not assume any CLI tool is pre-installed. Before using a tool (e.g., lsof, jq, go, python3),",
+    "check if it exists with 'command -v tool' or 'which tool', and install it if missing using apt-get, pip, or the appropriate package manager.",
+    "Include both the check and installation commands in the script.",
 )
 
-_VALID_JSON_SYSTEM = (
-    "Reply with one valid JSON object and nothing else. "
-    "Use double quotes. Escape quotation marks and newlines inside strings. "
-    "Do not use comments, trailing commas, or a markdown fence."
+_ENSURE_TOOLS_IN_SCRIPT = _section(
+    "For CLI phases that use tools (lsof, jq, go, python3, etc.), always include a check and installation command in the script.",
+    "Check for tools with 'command -v tool' or 'which tool', then install if missing using apt-get, pip, or the appropriate package manager.",
+)
+
+_FREE_PORT = _section(
+    "When creating a service that listens on a network port (HTTP server, API, etc.), do not hardcode a port number.",
+    'Instead, include a CLI phase before the CODING phase to find a free port using \'python3 -c "import socket; s=socket.socket(); s.bind((\'\',0)); print(s.getsockname()[1]); s.close()"\'',
+    "or similar, then pass that port to the CODING phase via the code content or use it in subsequent phases.",
+    "This avoids port conflicts with other services.",
+)
+
+_FREE_PORT_IN_PLAN = _section(
+    "When creating a service that listens on a network port, first include a CLI phase to find a free port dynamically.",
+    'Use \'python3 -c "import socket; s=socket.socket(); s.bind((\'\',0)); print(s.getsockname()[1]); s.close()"\' to get a free port,',
+    "then pass that port to the CODING phase in the code content or use it in subsequent CLI phases.",
+)
+
+_NO_ENV_VARS = _section(
+    "IMPORTANT: Never use environment variables ($VAR) in CLI operations. Use concrete values instead.",
+    "For example, instead of 'curl http://localhost:$PORT', use 'curl http://localhost:8080'.",
+    "Instead of 'docker port $container_id 5000', write a step that gets the actual container ID and uses it directly.",
+)
+
+_NO_DOCKER = _section(
+    "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for any test step.",
+    "All CLI operations must run directly in the host environment without containers.",
+    "Do not instruct the agent to start containers, use docker commands, or containerize any part of the test execution.",
+)
+
+_NO_DOCKER_COMMANDS = _section(
+    "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for any operation.",
+    "All commands must run directly in the host environment without containers.",
+)
+
+_NO_DOCKER_FIX = _section(
+    "IMPORTANT: Never use Docker or any containerizing techniques (docker run, docker-compose, kubectl, podman, etc.) for the fix.",
+    "All operations must run directly in the host environment without containers.",
+)
+
+_CLI_VERIFICATION = _section(
+    "A CLI verification is decided only from $? , stdout, and stderr after that phase's script runs.",
+    "The script must print the evidence the check needs.",
+    "Each CLI verification names what $? , stdout, or stderr must show, in one or two sentences.",
+    "Do not write a vague check such as 'the background service is running',",
+    "'the log is available for later inspection', 'a process is present', or 'the service is listening'.",
+    "If a service is started in the background, the same script must then print proof, for example by calling curl on the health URL.",
+    "The verification then says what that command produced, such as '$? is 0 and stdout is OK.'",
+)
+
+_CLI_VERIFICATION_REPAIR = _section(
+    "A CLI verification is decided only from $? , stdout, and stderr.",
+    "The script must print the evidence, and the verification must say what $? , stdout, or stderr must show.",
+    "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'.",
+)
+
+_CLI_VERIFICATION_UPDATE = _section(
+    "A CLI verification names what $? , stdout, or stderr must show after the script runs.",
+    "The script must print that evidence.",
+    "Do not write a vague check such as 'the background service is running' or 'the log is available for later inspection'.",
+)
+
+_AGENT_CAPABILITIES = _prompt(
+    _ROOT_PRIVILEGE,
+    _CAPABILITIES,
+    _WORK_DIRECTORY,
+    _BASH_LOGGING,
+    _BACKGROUND_SERVICE,
+    _ENSURE_TOOLS,
+    _FREE_PORT,
+)
+
+_PLAN_ROLE = _section(
+    "You are the planner, not the executor. Another system will run the phases you write:",
+    "GUI phases in the browser, CLI phases with host CLI tools, and CODING phases with the Pi coding agent.",
+    "Do not reject a request because you cannot click, browse, read files, or write code yourself.",
+    "Turn the testing request into one linear pipeline of testing phases.",
+    "Reply with one JSON object only, with keys accepted, reason, and phases.",
+    "Each phase is a chain of operations followed by the verifications of those operations.",
+)
+
+_PLAN_SCHEMA = _section(
+    "A phase has phase (an integer), name, depends_on (a list of earlier phase numbers, or empty),",
+    "interface (GUI, CLI, or CODING), gui_driver (browser or null), operations, script, coding_operations, and verifications.",
+    "GUI operations are objects with action goto, type, click, or press, plus text and selector {role, name} when needed.",
+    "A GUI phase sets gui_driver to browser.",
+)
+
+_CLI_SCRIPT = _section(
+    "A CLI phase sets interface to CLI and puts the whole bash script in script.",
+    "script is one string the agent runs with bash. Include every command, in order, with newlines escaped as \\n.",
+    "Use set -e so a failing command stops the script.",
+    "IMPORTANT: NEVER use sudo - the agent runs as root.",
+    "source, &&, and a trailing & belong in that script. Do not describe the commands in prose.",
+)
+
+_CODING_PHASE = _section(
+    "CODING operations are objects with action create_file, update_file, or review_code, plus file_path, content, and description.",
+    "When the user asks for a CODING phase, or asks the agent to generate code or files, that phase uses interface CODING",
+    "and coding_operations. It does not use interface CLI.",
+    "GUI verifications are questions about the page after the operations.",
+)
+
+_VERIFICATION_WORDING = _section(
+    "CODING verifications are questions about the files the Pi coding agent wrote.",
+    "Name the file and what it should contain.",
+    "The check is judged from the file that was written, not from a message that the operation succeeded.",
+)
+
+_VERIFICATION_STYLE = _section(
+    "Write every verification as one or two complete sentences. Be specific and verbose.",
+    "Keep the original meaning of the user's check. Do not add a condition they did not ask for, and do not drop one they did.",
+    "Do not shorten a check into contains:, json:, or status:.",
+    "If the user says a command returns nothing or mentions its output, say whether stdout is empty.",
+    "Express a CLI check as a claim about $? , stdout, or stderr that the script prints.",
+    "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr.",
+    "Example: 'Run ls. Verify that it returns nothing.' has verification",
+    "'The ls command returns nothing. stdout is empty. A successful exit code does not satisfy this check.'",
+    "Example: 'Run curl and verify that it reports an error.' has verification",
+    "'The curl command reports an error.' It does not mention stdout.",
+)
+
+_PHASE_LAYOUT = _section(
+    "Every phase needs at least one verification.",
+    "Put a phase that needs another phase's result after that phase, and list it in depends_on.",
+    "One page visit is one GUI phase. Navigation, typing, and the click are that phase's operations.",
+    "The page check is a verification on that same phase, not a later phase.",
+    "A request to open a page, type into a named field, click a named button, and then check the page text",
+    "is accepted true as one GUI phase. It is not a contradiction.",
+    "Use the field name and button name from the request.",
+)
+
+_GUI_PHASE_EXAMPLE = _section(
+    "Example: open http://localhost:8765, type ada into Username, click Commit, and verify the page contains registered becomes",
+    '{"accepted": true, "reason": null, "phases": [{"phase": 1, "name": "Register ada", "depends_on": [],',
+    '"interface": "GUI", "gui_driver": "browser", "operations": [',
+    '{"action": "goto", "text": "http://localhost:8765"},',
+    '{"action": "type", "selector": {"role": "textbox", "name": "Username"}, "text": "ada"},',
+    '{"action": "click", "selector": {"role": "button", "name": "Commit"}}],',
+    '"verifications": ["The page contains registered"]}]}',
+)
+
+_ACCEPTANCE = _section(
+    "Set accepted false only when the request itself is not a test, contradicts itself,",
+    "or asks for a check whose result nothing in the request produces.",
+    "When accepted is false, leave phases empty and explain that request problem in reason.",
+    "Do not reject because a page check comes after the click that produces the page.",
+)
+
+_PLAN_SYSTEM = _prompt(
+    _AGENT_CAPABILITIES,
+    _PLAN_ROLE,
+    _PLAN_SCHEMA,
+    _CLI_SCRIPT,
+    _BASH_LOGGING,
+    _ENSURE_TOOLS_IN_SCRIPT,
+    _BACKGROUND_SERVICE,
+    _FREE_PORT_IN_PLAN,
+    _CODING_PHASE,
+    _CLI_VERIFICATION,
+    _VERIFICATION_WORDING,
+    _CODING_LOGGING,
+    _VERIFICATION_STYLE,
+    _NO_ENV_VARS,
+    _NO_DOCKER,
+    _PHASE_LAYOUT,
+    _GUI_PHASE_EXAMPLE,
+    _ACCEPTANCE,
+)
+
+
+_REPAIR_RULES = _section(
+    "Revise the testing plan so every phase is executable with the browser, a CLI command, or the Pi coding agent.",
+    "Keep a requested CODING phase as interface CODING with coding_operations.",
+    "Reply with one JSON object only, with keys accepted, reason, and phases.",
+    "Use the same phase schema: phase, name, depends_on, interface, gui_driver, operations, script, coding_operations, and verifications.",
+    "A CLI phase must include script, the complete bash script.",
+)
+
+_REPAIR_CHECKS = _section(
+    "verifications must be strings.",
+    "Every check the request asks for must appear as a verification written as one or two complete sentences.",
+    "Be verbose and keep the original meaning. Do not shorten a check into contains:, json:, or status:.",
+    "A command that should return nothing is described as empty stdout, not as an exit code.",
+    "Express a CLI check as a claim about $? , stdout, or stderr that the script prints.",
+    "Mention stderr only when the check is about an error, issue, exception, warning, failure, traceback, or stderr.",
+    "A page check belongs on the GUI phase whose operations produce that page. Never make the check its own phase.",
+    "A file, webhook, or command check is a later CLI phase whose depends_on lists the phase that produced it.",
+    "Coding operations (create_file, update_file, review_code, execute_code) belong in CODING phases.",
+    "CODING operations ARE valid test operations. They are not 'development activities' to be rejected.",
+    "IMPORTANT: When a phase has interface CODING, you MUST include coding_operations with the actual file operations.",
+    "Do not create a CODING phase with only verifications and no coding_operations.",
+    "Keep phases in an order that respects those dependencies.",
+    "You are the planner, not the executor. Do not reject a request because you cannot browse, read files or write code.",
+    "Opening a page, typing into a named field, clicking a named button, and checking the resulting page",
+    "is one accepted GUI phase. Use those names in the selectors.",
+    "Phases without verifications are allowed for setup/preparation steps.",
+    "If all phases have no verifications, the test passes if all operations succeed.",
+    "Set accepted false only when the request itself is not a test or contradicts itself.",
+    "IMPORTANT: NEVER use sudo in any CLI script - the agent runs as root.",
+)
+
+_REPAIR_SYSTEM = _prompt(
+    _AGENT_CAPABILITIES,
+    _REPAIR_RULES,
+    _CLI_VERIFICATION_REPAIR,
+    _BASH_LOGGING,
+    _BACKGROUND_SERVICE,
+    _REPAIR_CHECKS,
+    _ENSURE_TOOLS_IN_SCRIPT,
+    _FREE_PORT_IN_PLAN,
+)
+
+_REJECT_SYSTEM = _section(
+    "Explain why this testing request itself cannot be planned. Plain sentences, not JSON.",
+    "Describe only a problem in the request: it is not a test, two requirements contradict each other,",
+    "or a check needs a result the request never produces.",
+    "CODING operations (create_file, update_file, review_code, execute_code) ARE valid test operations.",
+    "Do not reject a request just because it involves writing code or creating files.",
+    "Do not say the agent cannot start a server, execute generated code, or call a health endpoint.",
+    "Those steps are a CLI phase after the CODING phase that writes the service.",
+    "Do not call it a contradiction when the request opens a page, fills a field, clicks a button,",
+    "and then checks the page text. That is one GUI phase, with the check after the click.",
+    "Do not talk about a verification phase that has no operations.",
+)
+
+_OPS_EXAMPLE = _section(
+    "Reply with one JSON object only, no markdown.",
+    '{"operations": [{"step": 1, "operations": [',
+    '{"action": "goto", "text": "http://127.0.0.1:8765"},',
+    '{"action": "type", "selector": {"role": "textbox", "name": "Username"}, "text": "ada"},',
+    '{"action": "click", "selector": {"role": "button", "name": "Register"}}',
+    "]}]}",
+)
+
+_OPS_SYSTEM = _prompt(
+    _OPS_EXAMPLE,
+    _section(
+        "Include every control the phase names, including the submit click.",
+        "Use the field name and button name from the phase text.",
+        "If the phase says Username, the textbox name is Username.",
+        "If the phase says Commit, the button name is Commit.",
+        "Use the given target URL for goto.",
+    ),
+)
+
+_SCRIPT_RULES = _section(
+    "Reply with Python only, no markdown and no functions.",
+    "Perform the operation in the user message and print its result to stdout.",
+    "Do not read /evidence unless the operation names a file there.",
+    "IMPORTANT: Always prefer direct CLI commands over Python scripts when possible.",
+    "Use common CLI tools like curl, wget, jq, grep, sed, awk, etc.",
+    "Only use Python scripts when the operation requires complex logic, loops, or data processing that CLI tools cannot handle.",
+    "IMPORTANT: Never use environment variables ($VAR) in commands. Use concrete values instead.",
+    "For example, instead of 'curl http://localhost:$PORT', use 'curl http://localhost:8080'.",
+    "Instead of 'docker port $container_id 5000', use the actual container ID.",
+)
+
+_SCRIPT_SYSTEM = _prompt(
+    _SCRIPT_RULES,
+    _NO_DOCKER_COMMANDS,
+    _SCRIPT_LOGGING,
+    _BACKGROUND_SERVICE,
+)
+
+_FIX_STEP_RULES = _section(
+    "You are fixing a failed test step.",
+    "Review the failed step and the error message, then determine if this is a hard failure that cannot be fixed by retrying.",
+    "Hard failures include:",
+    "- Port conflicts (e.g., 'Address already in use', 'port is in use')",
+    "- Missing dependencies that cannot be installed (e.g., 'No module named X' when X is not available)",
+    "- Permission errors that cannot be resolved (e.g., 'Permission denied' for system files)",
+    "- Network errors indicating the service is not running on the expected port",
+    "- File not found errors for files that don't exist and cannot be created",
+    "- Service startup failures that indicate the service cannot run (e.g., 'ModuleNotFoundError' for required modules)",
+    "If the error is a hard failure, set should_retry to false and explain why in judgment, in one or two sentences.",
+    "If the error can be fixed, set should_retry to true and provide the corrected step.",
+    "The step is retried at most 3 times, and only when should_retry is true.",
+    "Reply with one JSON object only.",
+    "If should_retry is true, include the corrected step with these fields: step, interface, gui_driver, action, assertion, verifications, operations, script, coding_operations.",
+    "Keep the same step number and interface.",
+    "For a CLI step, script is the whole bash script to run. Replace that script to fix the failure.",
+    "Common fixes:",
+    "- If file not found: correct the file path or create the file first",
+    "- If command not found: use the correct command name or install the tool",
+    "- If permission denied: the agent runs as root, so permission should not be an issue - check the actual error",
+    "- If syntax error: fix the command syntax",
+    "- If timeout: add a longer timeout or break into smaller steps",
+    "- If dependency missing: add a step to install the dependency",
+    "Return JSON with keys: 'should_retry' (true or false), 'step' (the corrected step, only if should_retry is true), 'judgment' (explanation).",
+)
+
+_FIX_STEP_SYSTEM = _prompt(
+    _FIX_STEP_RULES,
+    _NO_DOCKER_FIX,
+    _BASH_LOGGING,
+    _BACKGROUND_SERVICE,
+)
+
+_PLAN_UPDATE_REPLY = _section(
+    "You are a test planning assistant. The user may ask a question about the current plan or ask you to change it.",
+    "Reply with one valid JSON object and nothing else.",
+    "Do not add prose, markdown, or a code fence around it.",
+    "Use double quotes for every key and string.",
+    "Escape quotation marks and newlines inside strings.",
+    "Do not use comments or trailing commas.",
+    "If the user asks a question, return",
+    '{"type": "answer", "answer": "the answer in sentences"}.',
+    "If the user asks to change the plan, return the complete plan that should exist after the change:",
+    '{"type": "plan_update", "reasoning": "one or two sentences", "phases": []}.',
+)
+
+_PLAN_UPDATE_SHAPE = _section(
+    "Each phase has phase, name, interface, depends_on, operation_notes, script, verifications, and coding_operations.",
+    "phase is a whole number: 1, then 2, then 3. Never use a decimal such as 1.5.",
+    "To insert a phase, renumber every later phase.",
+    "interface is GUI, CLI, or CODING.",
+    "A GUI phase sets gui_driver to browser.",
+    "A CLI phase sets script to the complete bash script, with newlines escaped as \\n.",
+    "Do not put the commands in prose.",
+    "Each CLI script starts a new shell. source does not carry into the next phase.",
+    "A later phase that needs the virtual environment must source it again at the start of its script,",
+    "or call venv/bin/pip and venv/bin/python.",
+    "The phases array is the complete plan after the change.",
+    "The agent stores that list as the plan.",
+    "Include every phase that should still run, with its script or its file content.",
+    "When the user asks to remove or merge phases, leave those phases out of the list and fix depends_on so every dependency is a phase in the list.",
+    "A CODING phase puts create_file, update_file, or review_code objects in coding_operations,",
+    "each with action, file_path, content, and description.",
+)
+
+_REFINE_PLAN_SYSTEM = _prompt(
+    _AGENT_CAPABILITIES,
+    _PLAN_UPDATE_REPLY,
+    _PLAN_UPDATE_SHAPE,
+    _CLI_VERIFICATION_UPDATE,
+)
+
+_VALID_JSON_SYSTEM = _section(
+    "Reply with one valid JSON object and nothing else.",
+    "Use double quotes. Escape quotation marks and newlines inside strings.",
+    "Do not use comments, trailing commas, or a markdown fence.",
 )
 
 _NETWORK_COMMANDS = frozenset({"curl", "wget", "ping", "dig", "nslookup", "host", "nc", "ncat", "pip", "pip3", "npm", "npm install", "apt", "apt-get", "yum", "dnf"})
@@ -676,13 +835,13 @@ _REFUSED_TO_PLAN = (
     "available tools",
 )
 
-_SERVICE_PIPELINE = (
-    "Host CLI tools start a process and call a network endpoint. "
-    "Generate the service source in a CODING phase with coding_operations. "
-    "Start that process in the background, then in that same CLI phase or a later CLI phase print proof with a concrete command such as curl. "
-    "The verification names $? and the stdout of that command. "
-    "Use a concrete port. "
-    "Do not reject the request because the generated code must run or a live endpoint must be called. "
+_SERVICE_PIPELINE = _section(
+    "Host CLI tools start a process and call a network endpoint.",
+    "Generate the service source in a CODING phase with coding_operations.",
+    "Start that process in the background, then in that same CLI phase or a later CLI phase print proof with a concrete command such as curl.",
+    "The verification names $? and the stdout of that command.",
+    "Use a concrete port.",
+    "Do not reject the request because the generated code must run or a live endpoint must be called.",
 )
 
 
@@ -848,6 +1007,38 @@ def _bash_script(raw: object, notes: list[str]) -> str:
     return f"set -e\n{command}\n"
 
 
+_INTERFACE_ALIASES = {
+    "gui": "GUI",
+    "browser": "GUI",
+    "web": "GUI",
+    "ui": "GUI",
+    "cli": "CLI",
+    "shell": "CLI",
+    "bash": "CLI",
+    "command": "CLI",
+    "command line": "CLI",
+    "commandline": "CLI",
+    "terminal": "CLI",
+    "coding": "CODING",
+    "code": "CODING",
+}
+
+
+def _phase_field(item: dict, *names: str) -> object:
+    """Read a phase field, ignoring the capitalization of the key."""
+    by_name = {str(key).lower(): value for key, value in item.items()}
+    for name in names:
+        value = by_name.get(name.lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _normalize_interface(raw: object) -> str:
+    text = str(raw or "").strip().lower().replace("_", " ").replace("-", " ")
+    return _INTERFACE_ALIASES.get(text, text.upper())
+
+
 def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
     phases: list[TestPhase] = []
     problems: list[str] = []
@@ -855,21 +1046,22 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
         if not isinstance(item, dict):
             problems.append(f"Phase {index} is not an object, so its operations and verifications cannot be read.")
             continue
-        number = _phase_number(item.get("phase") or item.get("id"), index)
-        name = str(item.get("name") or item.get("title") or "").strip()
-        notes, actions = _split_operations(item.get("operations") or item.get("operation"))
+        number = _phase_number(_phase_field(item, "phase", "id"), index)
+        name = str(_phase_field(item, "name", "title") or "").strip()
+        notes, actions = _split_operations(_phase_field(item, "operations", "operation", "commands", "command", "steps"))
         if not notes:
-            notes = _string_list(item.get("operation_notes"))
-        verifications = _string_list(item.get("verifications") or item.get("verification") or item.get("assertions"))
+            notes = _string_list(_phase_field(item, "operation_notes"))
+        verifications = _string_list(_phase_field(item, "verifications", "verification", "assertions"))
         if not name:
             name = notes[0] if notes else f"Phase {number}"
-        interface = str(item.get("interface") or "").strip().upper()
-        driver = item.get("gui_driver")
+        interface = _normalize_interface(_phase_field(item, "interface", "type", "kind", "driver"))
+        driver = _phase_field(item, "gui_driver")
         driver_name = str(driver).strip().lower() if isinstance(driver, str) and driver.strip() else None
 
-        coding_operations = _coding_operations_from(item.get("coding_operations") or [])
+        coding_operations = _coding_operations_from(_phase_field(item, "coding_operations") or [])
         if not coding_operations:
-            coding_operations = _coding_operations_from(item.get("operations") or [])
+            coding_operations = _coding_operations_from(_phase_field(item, "operations") or [])
+        script_value = _phase_field(item, "script", "bash", "bash_script", "shell")
 
         # Auto-detect interface if not specified
         if interface not in {"GUI", "CLI", "CODING"}:
@@ -877,7 +1069,9 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
                 interface = "CODING"
             elif driver_name == "browser" or actions:
                 interface = "GUI"
-            elif any(check.startswith(("json:", "status:")) for check in verifications):
+            elif isinstance(script_value, str) and script_value.strip():
+                interface = "CLI"
+            elif notes or any(check.startswith(("json:", "status:")) for check in verifications):
                 interface = "CLI"
             else:
                 problems.append(
@@ -892,10 +1086,7 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
             driver_name = None
         if interface == "CLI" and not verifications and notes:
             verifications = list(notes)
-        script = _bash_script(
-            item.get("script") or item.get("bash") or item.get("bash_script") or item.get("shell"),
-            notes,
-        )
+        script = _bash_script(script_value, notes)
         if interface == "CLI" and verifications and not notes and not actions and not script.strip():
             notes = [f"Carry out: {item}" for item in verifications]
         if interface == "CODING" and not verifications and notes:
@@ -1706,25 +1897,21 @@ def _parse_plan(content: str) -> PlanResult:
         logger.info(f"Processing {len(raw_phases)} phases")
         phases, problem = _coerce_phases(_integer_phases(raw_phases))
         if problem:
-            return PlanResult(accepted=False, reason=problem, reason_code="not_a_test_plan")
+            raise ValueError(problem)
         accepted = payload.get("accepted")
         if accepted is None:
             accepted = bool(phases)
         return PlanResult(accepted=bool(accepted), reason=reason_text, phases=phases)
 
+    raw_steps = payload.get("steps")
+    if not isinstance(raw_steps, list):
+        raise ValueError("The reply has no phases array.")
     logger.info("Processing steps instead of phases")
-    # Try to coerce steps with better error handling
     try:
-        payload["steps"] = _coerce_steps(payload.get("steps"))
+        payload["steps"] = _coerce_steps(raw_steps)
     except Exception as exc:  # noqa: BLE001
-        import traceback
-        error_detail = str(exc)
-        if hasattr(exc, "errors"):
-            error_detail = str(exc.errors())
-        logger.error(f"Step coercion failed: {error_detail}\n{traceback.format_exc()}")
-        logger.error(f"Raw steps: {payload.get('steps')}")
-        return _reject(f"planner output did not match the test plan schema: {error_detail}")
-    
+        logger.warning("Step coercion failed: %s", exc)
+        raise ValueError("The reply is not a test plan.") from exc
     if "accepted" not in payload:
         payload["accepted"] = bool(payload["steps"])
     if reason_text:
@@ -1732,25 +1919,17 @@ def _parse_plan(content: str) -> PlanResult:
     try:
         return PlanResult.model_validate(payload)
     except Exception as exc:  # noqa: BLE001
-        # Provide detailed error message
-        import traceback
-        error_detail = str(exc)
-        if hasattr(exc, "errors"):
-            # Pydantic validation error
-            error_detail = str(exc.errors())
-        logger.error(f"Plan validation failed: {error_detail}\n{traceback.format_exc()}")
-        logger.error(f"Payload: {payload}")
-        logger.error(f"Steps: {payload.get('steps')}")
-        return _reject(f"planner output did not match the test plan schema: {error_detail}")
-
+        logger.warning("Plan validation failed: %s", exc)
+        raise ValueError("The reply is not a test plan.") from exc
 
 
 class ChatModelPlanner:
     """Plans and writes scripts through the configured chat model."""
 
-    def __init__(self, model: BaseChatModel, target_url: str) -> None:
+    def __init__(self, model: BaseChatModel, target_url: str, max_retries: int = 3) -> None:
         self.model = model
         self.target_url = target_url
+        self.max_retries = max(1, max_retries)
         self.coding_instructions: list[dict] = []  # Track LLM's instructions to coding agent
 
     def plan(self, specification: str) -> PlanResult:
@@ -1786,13 +1965,40 @@ class ChatModelPlanner:
             SystemMessage(content=_PLAN_SYSTEM),
             HumanMessage(content=enhanced_specification),
         ]
-        try:
-            result, content = invoke_json(self.model, messages, _parse_plan)
-        except Exception as exc:  # noqa: BLE001 - unparseable model output is a rejection
-            import traceback
-            detail = str(exc).splitlines()[0]
-            logger.error(f"Plan parsing failed: {detail}\n{traceback.format_exc()}")
-            return _reject(f"planner output did not match the test plan schema: {detail}")
+        result: PlanResult | None = None
+        content = ""
+        attempts = self.max_retries
+        for attempt in range(1, attempts + 1):
+            logger.warning("Requesting a plan (attempt %s of %s)", attempt, attempts)
+            try:
+                message = self.model.invoke(messages)
+            except Exception as exc:  # noqa: BLE001 - a model failure uses another attempt
+                logger.warning("Plan request failed (attempt %s of %s): %s", attempt, attempts, exc)
+                if attempt == attempts:
+                    return _reject(_PLAN_UNAVAILABLE)
+                continue
+            content = message.content if isinstance(message.content, str) else str(message.content)
+            try:
+                result = _parse_plan(content)
+                break
+            except Exception as exc:  # noqa: BLE001 - send the broken reply back to be fixed
+                error = str(exc)
+                logger.warning(
+                    "Plan reply could not be used (attempt %s of %s): %s",
+                    attempt,
+                    attempts,
+                    error,
+                )
+                if attempt == attempts:
+                    logger.warning("Plan parsing failed after %s attempts", attempts)
+                    return _reject(_PLAN_UNAVAILABLE)
+                messages = [
+                    SystemMessage(content=_PLAN_SYSTEM),
+                    HumanMessage(content=enhanced_specification),
+                    HumanMessage(content=_plan_json_fix(content, error, specification)),
+                ]
+        if result is None:
+            return _reject(_PLAN_UNAVAILABLE)
         if not result.accepted and (
             _refused_to_plan(result.reason) or _structural_excuse(result.reason) or len(result.reason or "") < 160
         ):
@@ -1808,8 +2014,8 @@ class ChatModelPlanner:
                     "Do not reject that sequence.",
                 )
             except Exception as exc:  # noqa: BLE001 - a bad revision is a rejection
-                detail = str(exc).splitlines()[0]
-                return _reject(self._detail_rejection(specification, result.reason or detail))
+                logger.warning("Plan repair failed: %s", exc)
+                return _reject(self._detail_rejection(specification, result.reason))
             if not result.accepted and _refused_to_plan(result.reason):
                 try:
                     result = self._repair_plan(
@@ -1821,8 +2027,8 @@ class ChatModelPlanner:
                         + "Set accepted to true and return those phases.",
                     )
                 except Exception as exc:  # noqa: BLE001 - a bad revision is a rejection
-                    detail = str(exc).splitlines()[0]
-                    return _reject(self._detail_rejection(specification, result.reason or detail))
+                    logger.warning("Plan repair failed: %s", exc)
+                    return _reject(self._detail_rejection(specification, result.reason))
         if not result.accepted:
             return _reject(self._detail_rejection(specification, result.reason))
         if result.phases:
@@ -1832,8 +2038,8 @@ class ChatModelPlanner:
                 try:
                     result = self._repair_plan(specification, content, gap or result.reason or "")
                 except Exception as exc:  # noqa: BLE001 - a bad revision is a rejection
-                    detail = str(exc).splitlines()[0]
-                    return _reject(f"planner output did not match the test plan schema: {detail}")
+                    logger.warning("Plan repair failed: %s", exc)
+                    return _reject(_PLAN_UNAVAILABLE)
                 if result.phases:
                     result = result.model_copy(update={"phases": fold_check_phases(result.phases)})
                 if not result.accepted:
@@ -1856,8 +2062,8 @@ class ChatModelPlanner:
                 ordered = []
                 steps = self._ensure_operations(_collapse_gui_sequences(result.steps))
         except Exception as exc:  # noqa: BLE001 - unparseable operation output is a rejection
-            detail = str(exc).splitlines()[0]
-            return _reject(f"planner output did not match the test plan schema: {detail}")
+            logger.warning("Plan preparation failed: %s", exc)
+            return _reject(_PLAN_UNAVAILABLE)
         problem = _validate_steps(steps) or _missing_operations(steps)
         if problem:
             return _reject(self._detail_rejection(specification, problem))
@@ -1878,7 +2084,9 @@ class ChatModelPlanner:
         return revised
 
     def _detail_rejection(self, specification: str, finding: str | None) -> str:
-        text = (finding or "").strip() or "The request could not be turned into a linear testing plan."
+        text = _user_facing_reason(finding, _PLAN_UNAVAILABLE)
+        if text == _PLAN_UNAVAILABLE:
+            return text
         if len(text) >= 160:
             return text
         try:
@@ -1893,7 +2101,7 @@ class ChatModelPlanner:
             explained = message.content if isinstance(message.content, str) else str(message.content)
         except Exception:  # noqa: BLE001 - keep the finding when the explanation call fails
             return text
-        explained = _strip_fence(explained).strip()
+        explained = _user_facing_reason(_strip_fence(explained).strip(), text)
         if len(explained) < 80 or explained.startswith(("{", "[")):
             return text
         return explained
@@ -2006,64 +2214,81 @@ class ChatModelPlanner:
             ),
         ]
         
-        # Retry logic for JSON parsing errors
-        max_retries = 3
-        last_error = None
-        
-        for attempt in range(max_retries):
+        response: dict | None = None
+        content = ""
+        attempts = self.max_retries
+        for attempt in range(1, attempts + 1):
+            logger.warning("Requesting a plan update (attempt %s of %s)", attempt, attempts)
             try:
-                response, content = invoke_json(self.model, messages, _json_object)
-                
-                # Check if this is an answer or a plan update
-                if response.get("type") == "answer":
-                    # User asked a question, return the answer without changing the plan
-                    return current_phases, current_steps, response.get("answer", "Answer provided.")
-                elif response.get("type") == "plan_update" or "phases" in response:
-                    phases, steps, problem = _apply_phase_update(
-                        current_phases,
-                        response.get("phases") or [],
-                        user_feedback,
-                    )
-                    if problem:
-                        repair_messages = [
-                            SystemMessage(content=_REPAIR_SYSTEM),
-                            HumanMessage(
-                                content=(
-                                    f"User feedback: {user_feedback}\n\n"
-                                    f"Current phases must all remain unless the user asked to remove one.\n"
-                                    f"Draft phases:\n{content}\n\n"
-                                    f"What is wrong:\n{problem}"
-                                )
-                            ),
-                        ]
-                        revised, _repaired_text = invoke_json(self.model, repair_messages, _json_object)
-                        phases, steps, problem = _apply_phase_update(
-                            current_phases,
-                            revised.get("phases") or [],
-                            user_feedback,
+                message = self.model.invoke(messages)
+            except Exception as exc:  # noqa: BLE001 - a model failure uses another attempt
+                logger.warning("Plan update request failed (attempt %s of %s): %s", attempt, attempts, exc)
+                if attempt == attempts:
+                    return current_phases, current_steps, _PLAN_UPDATE_UNAVAILABLE
+                continue
+            content = message.content if isinstance(message.content, str) else str(message.content)
+            try:
+                response = _json_object(content)
+                break
+            except Exception as exc:  # noqa: BLE001 - send the broken reply back to be fixed
+                error = str(exc)
+                logger.warning(
+                    "Model reply was not valid JSON (attempt %s of %s): %s",
+                    attempt,
+                    attempts,
+                    error,
+                )
+                if attempt == attempts:
+                    return current_phases, current_steps, _PLAN_UPDATE_UNAVAILABLE
+                messages = [
+                    SystemMessage(content=_REFINE_PLAN_SYSTEM),
+                    HumanMessage(
+                        content=(
+                            f"User feedback: {user_feedback}\n\n"
+                            f"Current phases JSON:\n{plan_json}\n\n"
+                            f"{history_context}"
                         )
-                    if problem:
-                        return current_phases, current_steps, f"The updated phases are not executable. {problem}"
-                    reasoning = response.get("reasoning") or "Plan refined based on user feedback."
-                    return phases, steps, reasoning
-                else:
-                    return current_phases, current_steps, response.get("answer") or response.get("reasoning") or "Answer provided."
-            except ValueError as exc:
-                last_error = exc
-                logger.warning(f"Refine plan attempt {attempt + 1}/{max_retries} failed: {exc}")
-                if attempt < max_retries - 1:
-                    continue
-                # All retries failed, return error message
-                import traceback
-                logger.warning(f"Failed to refine plan after {max_retries} attempts: {exc}\n{traceback.format_exc()}")
-                return current_phases, current_steps, "The AI returned an invalid response format. Please try again."
-            except Exception as exc:  # noqa: BLE001
-                import traceback
-                logger.warning(f"Failed to refine plan: {exc}\n{traceback.format_exc()}")
-                return current_phases, current_steps, f"Failed to refine plan: {exc}"
-        
-        # This should not be reached, but just in case
-        return current_phases, current_steps, f"Failed to refine plan: {last_error}"
+                    ),
+                    HumanMessage(content=_plan_json_fix(content, error, user_feedback)),
+                ]
+        if response is None:
+            return current_phases, current_steps, _PLAN_UPDATE_UNAVAILABLE
+
+        if response.get("type") == "answer":
+            return current_phases, current_steps, response.get("answer", "Answer provided.")
+        if response.get("type") == "plan_update" or "phases" in response:
+            phases, steps, problem = _apply_phase_update(
+                current_phases,
+                response.get("phases") or [],
+                user_feedback,
+            )
+            if problem:
+                repair_messages = [
+                    SystemMessage(content=_REPAIR_SYSTEM),
+                    HumanMessage(
+                        content=(
+                            f"User feedback: {user_feedback}\n\n"
+                            f"Current phases must all remain unless the user asked to remove one.\n"
+                            f"Draft phases:\n{content}\n\n"
+                            f"What is wrong:\n{problem}"
+                        )
+                    ),
+                ]
+                try:
+                    revised, _repaired_text = invoke_json(self.model, repair_messages, _json_object)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to refine plan: %s", exc)
+                    return current_phases, current_steps, _PLAN_UPDATE_UNAVAILABLE
+                phases, steps, problem = _apply_phase_update(
+                    current_phases,
+                    revised.get("phases") or [],
+                    user_feedback,
+                )
+            if problem:
+                return current_phases, current_steps, f"The updated phases are not executable. {problem}"
+            reasoning = response.get("reasoning") or "Plan refined based on user feedback."
+            return phases, steps, reasoning
+        return current_phases, current_steps, response.get("answer") or response.get("reasoning") or "Answer provided."
 
 
 def _command_line(line: str) -> str:
@@ -2167,4 +2392,4 @@ def command_script(command: str) -> str:
 def build_planner(config: EngineConfig) -> Planner:
     from aqe.chat import get_chat_model
 
-    return ChatModelPlanner(get_chat_model(), config.target_url)
+    return ChatModelPlanner(get_chat_model(), config.target_url, max_retries=config.max_retries)

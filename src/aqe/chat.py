@@ -113,5 +113,6 @@ def get_chat_model() -> BaseChatModel:
                 model=model,
                 base_url=settings.ollama_base_url,
                 temperature=temperature,
+                client_kwargs={"timeout": 180},
             )
     raise RuntimeError("Failed to initialize LLM client")
