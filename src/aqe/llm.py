@@ -229,12 +229,48 @@ _CODING_LOGGING = _section(
 )
 
 _BACKGROUND_SERVICE = _section(
-    "IMPORTANT: When starting a background service (HTTP server, API, database, etc.) for subsequent phases to use,",
-    "always start it in the background using '&' or 'nohup ... &' so the phase can complete without waiting for the service.",
-    "Redirect service output to a log file in the work directory (e.g., 'nohup python server.py > service.log 2>&1 &').",
-    "Save the process ID (PID) to a file if needed for later cleanup (e.g., 'echo $! > service.pid').",
-    "Do not wait for the service to finish - the phase should complete immediately after starting it.",
-    "Subsequent phases can then interact with the running service (e.g., curl health endpoint, check logs).",
+    "IMPORTANT: When a test requires a background service (HTTP server, API, database, etc.),",
+    "put the service creation, testing logic, and cleanup ALL IN THE SAME PHASE.",
+    "This prevents zombie processes because the shell remains the parent when it kills the background children.",
+    "The phase should follow this pattern: start service -> test service -> kill service -> wait for shutdown -> verify process dead -> cleanup files -> verify files gone.",
+    "Example single-phase pattern:",
+    "'nohup python server.py > service.log 2>&1 & echo $! > service.pid'",
+    "'sleep 2  # wait for service to start'",
+    "'curl http://localhost:$PORT/health  # test the service'",
+    "'kill $(cat service.pid) 2>/dev/null || true  # kill while still parent'",
+    "'sleep 1  # wait for service to shutdown'",
+    "'! kill -0 $(cat service.pid) 2>/dev/null  # verify process is dead BEFORE removing PID file'",
+    "'rm -f service.pid service.log  # cleanup files'",
+    "'! test -f service.pid  # verify files are gone'",
+    "IMPORTANT: The phase MUST include verifications to confirm BOTH the background service was killed AND files were removed.",
+    "After killing the service, add a short sleep (e.g., 'sleep 1') to allow the service time to shutdown gracefully.",
+    "Then verify the process is dead BEFORE removing the PID file, otherwise you cannot check the process status.",
+    "Verification sequence:",
+    "1. Kill the service",
+    "2. Sleep briefly to allow shutdown (e.g., 'sleep 1')",
+    "3. Verify it's dead using '! kill -0 $(cat service.pid) 2>/dev/null'",
+    "4. Then remove the PID file and other temporary files",
+    "5. Finally verify files are gone using '! test -f service.pid'",
+    "The phase should have at least one verification that confirms the service was cleaned up.",
+    "Example verification: 'The background service process is not running, service.pid does not exist, and service.log does not exist.'",
+    "Do NOT split service creation and cleanup across different phases - this creates orphaned processes that become zombies.",
+    "If a service needs to persist across multiple test phases, use a separate cleanup phase that depends on those phases.",
+)
+
+_CLEANUP = _section(
+    "IMPORTANT: Add a final cleanup phase at the end of the test plan to clean up resources created during the test.",
+    "This cleanup phase should stop any background services, remove temporary files, and kill any processes that were started.",
+    "If a service PID was saved to a file (e.g., service.pid), read that file and kill the process using 'kill $(cat service.pid)'.",
+    "Remove temporary files created during the test (e.g., 'rm -f port.txt service.log service.pid').",
+    "The cleanup phase should depend on all phases that create resources that need cleanup.",
+    "The cleanup phase should have interface CLI and include appropriate cleanup commands in the script.",
+    "Example cleanup phase: 'Phase 5: Cleanup' with script that kills services and removes temporary files.",
+    "IMPORTANT: The cleanup phase MUST include verifications to confirm cleanup was successful.",
+    "After cleanup commands, add verification checks to ensure:",
+    "- All temporary files have been removed (e.g., '! test -f port.txt' to verify file is gone)",
+    "- All background processes have been killed (e.g., '! kill -0 $(cat service.pid) 2>/dev/null' to verify process is dead)",
+    "The cleanup phase should have at least one verification that confirms resources were cleaned up.",
+    "Example verification: 'port.txt does not exist, service.log does not exist, and the background service process is not running.'",
 )
 
 _ENSURE_TOOLS = _section(
@@ -311,6 +347,7 @@ _AGENT_CAPABILITIES = _prompt(
     _WORK_DIRECTORY,
     _BASH_LOGGING,
     _BACKGROUND_SERVICE,
+    _CLEANUP,
     _ENSURE_TOOLS,
     _FREE_PORT,
 )
@@ -375,6 +412,18 @@ _PHASE_LAYOUT = _section(
     "Use the field name and button name from the request.",
 )
 
+_ATOMIC_PHASES = _section(
+    "IMPORTANT: Make each test phase atomic and focused on a single operation or logical unit of work.",
+    "Each phase should do one thing well and be independently verifiable.",
+    "Avoid mixing multiple unrelated operations in a single phase (e.g., don't combine 'install dependencies', 'find port', and 'start service' in one phase).",
+    "If a phase fails, it should be immediately clear what operation failed.",
+    "Break complex tasks into smaller, focused phases that can be executed and verified independently.",
+    "Example: Instead of one phase that installs tools, finds a port, and starts a service, create three separate phases:",
+    "Phase 1: Install dependencies (verification: tools are installed)",
+    "Phase 2: Find free port (verification: port.txt contains a port number)",
+    "Phase 3: Start service (verification: service is running and responding)",
+)
+
 _GUI_PHASE_EXAMPLE = _section(
     "Example: open http://localhost:8765, type ada into Username, click Commit, and verify the page contains registered becomes",
     '{"accepted": true, "reason": null, "phases": [{"phase": 1, "name": "Register ada", "depends_on": [],',
@@ -400,6 +449,7 @@ _PLAN_SYSTEM = _prompt(
     _BASH_LOGGING,
     _ENSURE_TOOLS_IN_SCRIPT,
     _BACKGROUND_SERVICE,
+    _CLEANUP,
     _FREE_PORT_IN_PLAN,
     _CODING_PHASE,
     _CLI_VERIFICATION,
@@ -409,6 +459,7 @@ _PLAN_SYSTEM = _prompt(
     _NO_ENV_VARS,
     _NO_DOCKER,
     _PHASE_LAYOUT,
+    _ATOMIC_PHASES,
     _GUI_PHASE_EXAMPLE,
     _ACCEPTANCE,
 )
@@ -451,9 +502,11 @@ _REPAIR_SYSTEM = _prompt(
     _CLI_VERIFICATION_REPAIR,
     _BASH_LOGGING,
     _BACKGROUND_SERVICE,
+    _CLEANUP,
     _REPAIR_CHECKS,
     _ENSURE_TOOLS_IN_SCRIPT,
     _FREE_PORT_IN_PLAN,
+    _ATOMIC_PHASES,
 )
 
 _REJECT_SYSTEM = _section(
@@ -506,6 +559,7 @@ _SCRIPT_SYSTEM = _prompt(
     _NO_DOCKER_COMMANDS,
     _SCRIPT_LOGGING,
     _BACKGROUND_SERVICE,
+    _CLEANUP,
 )
 
 _FIX_STEP_RULES = _section(
@@ -540,6 +594,7 @@ _FIX_STEP_SYSTEM = _prompt(
     _NO_DOCKER_FIX,
     _BASH_LOGGING,
     _BACKGROUND_SERVICE,
+    _CLEANUP,
 )
 
 _PLAN_UPDATE_REPLY = _section(
@@ -579,6 +634,8 @@ _REFINE_PLAN_SYSTEM = _prompt(
     _PLAN_UPDATE_REPLY,
     _PLAN_UPDATE_SHAPE,
     _CLI_VERIFICATION_UPDATE,
+    _ATOMIC_PHASES,
+    _CLEANUP,
 )
 
 _VALID_JSON_SYSTEM = _section(
