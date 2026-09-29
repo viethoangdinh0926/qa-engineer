@@ -210,6 +210,14 @@ _BASH_LOGGING = _section(
     "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]').",
     'Example: \'echo "[INFO] Starting service on port $PORT"\' (stdout) or \'echo "[ERROR] Failed to connect to database" >&2\' (stderr).',
     "This makes stdout/stderr more informative for debugging test failures.",
+    "IMPORTANT: Suppress non-critical logs from package managers and system tools.",
+    "For apt, apt-get, pip, npm, and similar package installation commands, add flags to suppress verbose output:",
+    "- For apt/apt-get: add '-qq' flag for quiet mode",
+    "- For pip: add '--quiet' or '-q' flag",
+    "- For npm: add '--silent' or '--quiet' flag",
+    "- For other tools: use their respective quiet/silent flags",
+    "Example: 'apt-get update -qq && apt-get install -y -qq python3' instead of 'apt-get update && apt-get install -y python3'",
+    "This reduces noise in the output and makes logs more focused on the actual test operations.",
 )
 
 _SCRIPT_LOGGING = _section(

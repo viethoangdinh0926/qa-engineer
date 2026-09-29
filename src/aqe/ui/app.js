@@ -120,6 +120,7 @@ function renderShell() {
   } else if (state.view === "run-detail") {
     renderRunDetail();
   }
+  renderSpinner();
 }
 
 function renderHome() {
@@ -335,6 +336,7 @@ function setBusy(busy) {
     send.disabled = busy;
   }
   renderChatMessages();
+  renderSpinner();
 }
 
 function escapeHtml(value) {
@@ -823,6 +825,24 @@ async function sendPlannerMessage() {
     paintChrome();
   } finally {
     setBusy(false);
+  }
+}
+
+function renderSpinner() {
+  // Remove existing spinner
+  const existingSpinner = document.querySelector(".loading-spinner");
+  if (existingSpinner) {
+    existingSpinner.remove();
+  }
+  
+  // Add spinner if busy
+  if (state.busy) {
+    const spinner = document.createElement("div");
+    spinner.className = "loading-spinner";
+    const spinnerCircle = document.createElement("div");
+    spinnerCircle.className = "spinner-circle";
+    spinner.appendChild(spinnerCircle);
+    document.body.appendChild(spinner);
   }
 }
 
