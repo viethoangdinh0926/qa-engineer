@@ -206,6 +206,10 @@ body.busy textarea {
   border-radius: 6px;
   padding: 16px;
   margin-bottom: 12px;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
+  overflow-x: hidden;
 }
 
 .plan-phase h4 {
@@ -216,11 +220,31 @@ body.busy textarea {
 .plan-phase p {
   margin: 4px 0;
   font-size: 0.9rem;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
+}
+
+.plan-phase pre {
+  overflow-x: auto;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  word-break: break-all;
+}
+
+.plan-phase code {
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-all;
 }
 
 .plan-phase ul {
   margin: 4px 0;
   padding-left: 20px;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
 }
 
 .plan-status {

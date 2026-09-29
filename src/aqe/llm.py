@@ -211,12 +211,12 @@ _BASH_LOGGING = _section(
     'Example: \'echo "[INFO] Starting service on port $PORT"\' (stdout) or \'echo "[ERROR] Failed to connect to database" >&2\' (stderr).',
     "This makes stdout/stderr more informative for debugging test failures.",
     "IMPORTANT: Suppress non-critical logs from package managers and system tools.",
-    "For apt, apt-get, pip, npm, and similar package installation commands, add flags to suppress verbose output:",
-    "- For apt/apt-get: add '-qq' flag for quiet mode",
-    "- For pip: add '--quiet' or '-q' flag",
-    "- For npm: add '--silent' or '--quiet' flag",
-    "- For other tools: use their respective quiet/silent flags",
-    "Example: 'apt-get update -qq && apt-get install -y -qq python3' instead of 'apt-get update && apt-get install -y python3'",
+    "For apt, apt-get, pip, npm, and similar package installation commands, redirect output to suppress verbose logs:",
+    "- For apt/apt-get: add '-qq' and redirect stderr to /dev/null: 'apt-get install -y -qq package > /dev/null 2>&1'",
+    "- For pip: add '--quiet' or '-q' and redirect output: 'pip install --quiet package > /dev/null 2>&1'",
+    "- For npm: add '--silent' or '--quiet' and redirect output: 'npm install --silent package > /dev/null 2>&1'",
+    "- For other tools: use their respective quiet/silent flags and redirect output",
+    "Example: 'apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq python3 > /dev/null 2>&1'",
     "This reduces noise in the output and makes logs more focused on the actual test operations.",
 )
 
