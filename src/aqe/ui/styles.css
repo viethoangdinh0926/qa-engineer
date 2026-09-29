@@ -25,6 +25,7 @@ body {
     radial-gradient(900px 280px at 10% -10%, #d7ebe7 0%, transparent 60%),
     var(--paper);
   color: var(--ink);
+  overflow-x: hidden;
 }
 
 /* Main layout */
@@ -36,6 +37,7 @@ body {
 .main-content {
   flex: 1;
   padding: 20px;
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -290,6 +292,7 @@ main {
   width: min(880px, calc(100% - 32px));
   margin: 0 auto;
   padding: 24px 0 48px;
+  overflow-x: hidden;
 }
 
 .card {
@@ -464,17 +467,20 @@ button.run-toggle:hover { background: #f4faf8; }
   white-space: pre-wrap;
 }
 
-ol.steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+ol.steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; overflow-x: hidden; }
 
 ol.steps li {
   display: grid;
-  grid-template-columns: 92px 1fr auto;
+  grid-template-columns: 92px minmax(0, 1fr) auto;
   gap: 12px;
   align-items: start;
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--panel);
+  overflow: hidden;
+  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .tag, .status {
@@ -511,7 +517,8 @@ ol.steps li {
   color: var(--ink);
   font: 0.82rem/1.45 ui-monospace, "Cascadia Code", monospace;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .evidence details {
@@ -539,12 +546,95 @@ ol.steps li {
   padding: 8px;
   background: #f8f9fa;
   border-radius: 4px;
-  overflow-x: auto;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
   font-size: 0.8rem;
 }
 
+.verification-block {
+  margin: 12px 0;
+  padding: 12px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border: 1px solid #e0e6ed;
+}
+
+.verification-item {
+  margin: 8px 0;
+}
+
+.verification-separator {
+  margin: 12px 0;
+  border: none;
+  border-top: 1px solid #e0e6ed;
+}
+
+.verification-question {
+  margin: 0 0 4px 0;
+  font-weight: 600;
+  color: var(--ink);
+  font-size: 0.92rem;
+}
+
+.verification-result {
+  margin: 2px 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.verification-judgment {
+  margin: 2px 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-style: italic;
+}
+
+.evidence-block {
+  margin: 12px 0;
+}
+
+.evidence-collapsible {
+  margin: 8px 0;
+  background: #ffffff;
+  border: 1px solid #e0e6ed;
+  border-radius: 4px;
+  padding: 4px;
+}
+
+.evidence-collapsible summary {
+  cursor: pointer;
+  font-weight: 500;
+  color: var(--ink);
+  user-select: none;
+  outline: none;
+  padding: 4px;
+}
+
+.evidence-collapsible summary:hover {
+  background: #f8f9fa;
+}
+
+.evidence-content {
+  margin: 8px 0 0 0;
+  padding: 8px;
+  background: #f8f9fa;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  font-size: 0.8rem;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+}
+
 .action { margin: 0; font-size: 1rem; }
+.action .phase-highlight {
+  font-weight: 700;
+  color: var(--ink);
+  background: #f0f4f8;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
 .summary { margin: 6px 0 0; color: var(--muted); font-size: 0.92rem; white-space: pre-wrap; }
 
 @media (max-width: 640px) {

@@ -283,7 +283,6 @@ class CLISubsystem:
                     "stdout": stdout,
                     "stderr": stderr,
                     "summary": summary,
-                    "execution_type": "host",
                     "exit_code": exit_code
                 },
             )
@@ -294,7 +293,7 @@ class CLISubsystem:
                 return ActionResult(
                     ok=False,
                     summary="Python is not available and could not be installed",
-                    evidence={"stdout": "", "stderr": "Python not available", "execution_type": "host"},
+                    evidence={"stdout": "", "stderr": "Python not available"},
                 )
             
             # Write script to file
@@ -322,7 +321,6 @@ class CLISubsystem:
                         "stdout": stdout,
                         "stderr": stderr,
                         "summary": summary,
-                        "execution_type": "host",
                         "exit_code": result.returncode
                     },
                 )
@@ -330,13 +328,13 @@ class CLISubsystem:
                 return ActionResult(
                     ok=False,
                     summary="Python script timed out",
-                    evidence={"stdout": "", "stderr": "Script timed out", "execution_type": "host", "exit_code": 124},
+                    evidence={"stdout": "", "stderr": "Script timed out", "exit_code": 124},
                 )
             except (subprocess.SubprocessError, OSError) as e:
                 return ActionResult(
                     ok=False,
                     summary=f"Python script execution failed: {e}",
-                    evidence={"stdout": "", "stderr": str(e), "execution_type": "host", "exit_code": 1},
+                    evidence={"stdout": "", "stderr": str(e), "exit_code": 1},
                 )
 
     def _run_bash(self, script: str, work_dir: Path) -> ActionResult:
@@ -360,13 +358,13 @@ class CLISubsystem:
             return ActionResult(
                 ok=False,
                 summary="Bash script timed out",
-                evidence={"stdout": "", "stderr": "Script timed out", "execution_type": "host", "exit_code": 124},
+                evidence={"stdout": "", "stderr": "Script timed out", "exit_code": 124},
             )
         except (subprocess.SubprocessError, OSError) as exc:
             return ActionResult(
                 ok=False,
                 summary=f"Bash script execution failed: {exc}",
-                evidence={"stdout": "", "stderr": str(exc), "execution_type": "host", "exit_code": 1},
+                evidence={"stdout": "", "stderr": str(exc), "exit_code": 1},
             )
         stdout = result.stdout
         stderr = result.stderr
@@ -379,7 +377,6 @@ class CLISubsystem:
                 "stdout": stdout,
                 "stderr": stderr,
                 "summary": summary,
-                "execution_type": "host",
                 "exit_code": result.returncode,
                 "script_result": script_result,
             },

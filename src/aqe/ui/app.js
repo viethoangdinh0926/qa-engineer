@@ -139,6 +139,11 @@ function renderShell() {
   
   sidebar.append(sidebarHeader, chatContainer, chatInput);
   
+  // Stop click propagation when clicking inside sidebar
+  sidebar.addEventListener("click", (e) => {
+    e.stopPropagation();
+  });
+  
   // Main content area
   const mainContent = document.createElement("main");
   mainContent.className = "main-content";
@@ -193,11 +198,20 @@ function renderShell() {
   const sidebarToggle = document.createElement("button");
   sidebarToggle.className = "sidebar-toggle";
   sidebarToggle.textContent = "☰ Planner Chat";
-  sidebarToggle.addEventListener("click", () => {
+  sidebarToggle.addEventListener("click", (e) => {
+    e.stopPropagation();
     state.plannerChatOpen = !state.plannerChatOpen;
     sidebar.classList.toggle("open", state.plannerChatOpen);
   });
   app.prepend(sidebarToggle);
+  
+  // Add click outside to close sidebar (attach to document to catch all clicks)
+  document.addEventListener("click", (e) => {
+    if (state.plannerChatOpen && !sidebar.contains(e.target) && !sidebarToggle.contains(e.target)) {
+      state.plannerChatOpen = false;
+      sidebar.classList.remove("open");
+    }
+  });
 }
 
 function paintChrome() {
@@ -245,9 +259,13 @@ function stepDetails(step, detailed) {
   const body = document.createElement("div");
   const action = document.createElement("p");
   action.className = "action";
-  action.textContent = step.phase_name
-    ? `Phase ${step.phase || step.step}. ${step.phase_name}`
-    : `${step.step}. ${step.action}`;
+  if (step.phase_name) {
+    // Highlight "Phase x" part
+    const phaseText = `Phase ${step.phase || step.step}. `;
+    action.innerHTML = `<span class="phase-highlight">${phaseText}</span>${step.phase_name}`;
+  } else {
+    action.textContent = `${step.step}. ${step.action}`;
+  }
   body.append(action);
   if (step.depends_on && step.depends_on.length) {
     const depends = document.createElement("p");
@@ -281,27 +299,47 @@ function stepDetails(step, detailed) {
     codingOps.textContent = opText;
     body.append(codingOps);
   }
+  
+  // Show verification results with clear separation
   const checks = step.verification_results || [];
   if (checks.length) {
-    checks.forEach((check) => {
+    const verificationBlock = document.createElement("div");
+    verificationBlock.className = "verification-block";
+    
+    checks.forEach((check, index) => {
+      const verificationItem = document.createElement("div");
+      verificationItem.className = "verification-item";
+      
+      if (index > 0) {
+        const separator = document.createElement("hr");
+        separator.className = "verification-separator";
+        verificationItem.append(separator);
+      }
+      
       const question = document.createElement("p");
-      question.className = "summary";
-      question.textContent = `Verification: ${check.question}`;
-      body.append(question);
+      question.className = "verification-question";
+      question.textContent = `Verification ${index + 1}: ${check.question}`;
+      verificationItem.append(question);
+      
       if (detailed) {
         const judged = document.createElement("p");
-        judged.className = "summary";
+        judged.className = "verification-result";
         const passed = check.passed;
-        judged.textContent = `Verification result: ${passed === true ? "passed" : passed === false ? "failed" : "not judged"}`;
-        body.append(judged);
+        judged.textContent = `Result: ${passed === true ? "passed" : passed === false ? "failed" : "not judged"}`;
+        verificationItem.append(judged);
+        
         if (check.judgment) {
           const judgment = document.createElement("p");
-          judgment.className = "summary";
+          judgment.className = "verification-judgment";
           judgment.textContent = `Judgment: ${check.judgment}`;
-          body.append(judgment);
+          verificationItem.append(judgment);
         }
       }
+      
+      verificationBlock.append(verificationItem);
     });
+    
+    body.append(verificationBlock);
   } else if (detailed) {
     const assertion = document.createElement("p");
     assertion.className = "summary";
@@ -318,20 +356,45 @@ function stepDetails(step, detailed) {
       body.append(judgment);
     }
   }
-  if (detailed && step.summary) {
-    const summary = document.createElement("p");
-    summary.className = "summary";
-    summary.textContent = step.summary;
-    body.append(summary);
-  }
+  
+  // Show evidence with collapsible stdout/stderr/summary
   if (detailed) {
     const evidence = step.evidence || {};
-    const keys = Object.keys(evidence).filter((key) => key !== "page_source" && evidence[key]);
-    if (keys.length) {
-      const block = document.createElement("div");
-      block.className = "evidence";
-      block.innerHTML = keys.map((key) => `<div><strong>${key}:</strong><br>${formatEvidenceValue(evidence[key])}</div>`).join("<br>");
-      body.append(block);
+    const collapsibleKeys = ["stdout", "stderr", "summary"];
+    const otherKeys = Object.keys(evidence).filter((key) => key !== "page_source" && !collapsibleKeys.includes(key) && evidence[key]);
+    
+    if (collapsibleKeys.some(key => evidence[key]) || otherKeys.length) {
+      const evidenceBlock = document.createElement("div");
+      evidenceBlock.className = "evidence-block";
+      
+      // Collapsible evidence (stdout, stderr, summary)
+      collapsibleKeys.forEach((key) => {
+        if (evidence[key]) {
+          const collapsible = document.createElement("details");
+          collapsible.className = "evidence-collapsible";
+          
+          const summary = document.createElement("summary");
+          summary.textContent = `${key} (${evidence[key].length} chars)`;
+          collapsible.append(summary);
+          
+          const content = document.createElement("pre");
+          content.className = "evidence-content";
+          content.textContent = evidence[key];
+          collapsible.append(content);
+          
+          evidenceBlock.append(collapsible);
+        }
+      });
+      
+      // Other evidence keys
+      if (otherKeys.length) {
+        const otherBlock = document.createElement("div");
+        otherBlock.className = "evidence";
+        otherBlock.innerHTML = otherKeys.map((key) => `<div><strong>${key}:</strong><br>${formatEvidenceValue(evidence[key])}</div>`).join("<br>");
+        evidenceBlock.append(otherBlock);
+      }
+      
+      body.append(evidenceBlock);
     }
   } else if (!checks.length && step.summary) {
     const summary = document.createElement("p");
@@ -474,12 +537,14 @@ async function openRun(id) {
   state.currentRunId = id;
   state.currentPlan = null;
   state.plannerChatMessages = [];
-  state.plannerChatOpen = true;
-  window.history.pushState({}, "", `/runs/${id}`);
+  // Don't auto-open chat panel on page refresh or run open
+  state.plannerChatOpen = false;
+  // Ensure sidebar is closed
   const sidebar = document.querySelector("#planner-sidebar");
   if (sidebar) {
-    sidebar.classList.add("open");
+    sidebar.classList.remove("open");
   }
+  window.history.pushState({}, "", `/runs/${id}`);
   const response = await fetch(`/v1/runs/${id}`);
   if (response.ok) {
     upsertRun(await response.json());
@@ -526,11 +591,6 @@ async function submitSpecification(area, button) {
   state.formError = "";
   state.notice = "";
   paintChrome();
-  const sidebar = document.querySelector("#planner-sidebar");
-  if (sidebar) {
-    sidebar.classList.add("open");
-    state.plannerChatOpen = true;
-  }
   setBusy(true);
   button.disabled = true;
   try {
@@ -548,7 +608,24 @@ async function submitSpecification(area, button) {
     area.value = "";
     state.notice = `Plan ready for ${body.id}`;
     paintChrome();
-    await openRun(body.id);
+    // Open chat panel after successful plan creation
+    state.plannerChatOpen = true;
+    const sidebar = document.querySelector("#planner-sidebar");
+    if (sidebar) {
+      sidebar.classList.add("open");
+    }
+    // Open run without auto-opening chat panel
+    state.expandedId = body.id;
+    state.currentRunId = body.id;
+    state.currentPlan = null;
+    state.plannerChatMessages = [];
+    window.history.pushState({}, "", `/runs/${body.id}`);
+    const response2 = await fetch(`/v1/runs/${body.id}`);
+    if (response2.ok) {
+      upsertRun(await response2.json());
+    }
+    await loadPlan(body.id);
+    await loadChatHistory(body.id);
   } finally {
     button.disabled = false;
     setBusy(false);
@@ -766,6 +843,18 @@ async function refreshSelectedRun() {
 
 async function cancelExecution() {
   if (!state.currentRunId || state.busy) return;
+  
+  // Check if run is in a cancellable state
+  const run = state.runs.find((item) => item.id === state.currentRunId);
+  if (!run) return;
+  
+  // Don't cancel if already completed, canceled, or not running
+  if (run.ready || run.status === "canceled" || run.status === "completed" || run.status === "failed") {
+    state.notice = "Run is not in a cancellable state.";
+    paintChrome();
+    return;
+  }
+  
   const response = await fetch(`/v1/runs/${state.currentRunId}:cancel`, { method: "POST" });
   if (!response.ok) {
     const body = await response.json();

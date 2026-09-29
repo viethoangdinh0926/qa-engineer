@@ -14,8 +14,8 @@ from aqe.graph import GraphDeps, RunControl, initial_state, run_graph
 from aqe.gui.subsystem import GUISubsystem
 from aqe.judge import parse_judgment
 from aqe.llm import NONSENSE_SPEC, _parse_labeled_steps
-from aqe.service import RunService
 from aqe.plan_storage import PlanStorageManager
+from aqe.service import RunService
 from aqe.state import ActionResult, GUIAction, Judgment, PlanResult
 
 SAMPLE = Path("examples/specs/registration.md").read_text(encoding="utf-8")
@@ -258,7 +258,7 @@ def test_a_cli_verification_includes_the_exit_code() -> None:
     result = ActionResult(
         ok=False,
         summary="Bash script executed.",
-        evidence={"stdout": "", "stderr": "No such file", "exit_code": 1, "execution_type": "host"},
+        evidence={"stdout": "", "stderr": "No such file", "exit_code": 1},
     )
     update = validate_node(
         {
@@ -315,7 +315,6 @@ def test_a_zero_exit_is_judged_from_stdout_and_stderr() -> None:
             "stderr": "",
             "exit_code": 0,
             "script_result": "script_exit=0\nVIRTUAL_ENV=/work/venv\nvenv_dir=present\n",
-            "execution_type": "host",
         },
     )
     update = validate_node(
@@ -376,7 +375,7 @@ def test_a_cli_verification_runs_the_model_command(tmp_path: Path) -> None:
     result = ActionResult(
         ok=True,
         summary="Bash script executed.",
-        evidence={"stdout": "", "stderr": "", "exit_code": 0, "execution_type": "host"},
+        evidence={"stdout": "", "stderr": "", "exit_code": 0},
     )
     update = validate_node(
         {

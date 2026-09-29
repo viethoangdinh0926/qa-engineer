@@ -176,6 +176,8 @@ class RunService:
         record = self._runs.get(run_id)
         if record is None:
             return None
+        # Allow multiple cancel requests - just set the flag again
+        # This is idempotent and safe
         record.control.cancel_requested = True
         return self.snapshot(record)
 

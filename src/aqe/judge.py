@@ -2,9 +2,8 @@
 
 import json
 import re
-from typing import Protocol
-
 from dataclasses import dataclass
+from typing import Protocol
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -209,15 +208,23 @@ class CliCheck:
 _CLI_VERIFY_SYSTEM = (
     "You verify one CLI check. "
     "You receive the verification statement, the value of $?, stdout, and stderr from the phase script. "
+    "You also receive script_result when present, which records shell state like VIRTUAL_ENV and venv_dir. "
+    "You also receive the work directory where the phase script ran. "
     "Reply with one JSON object and nothing else. "
-    "If those four items are enough to decide, return "
+    "If those items are enough to decide, return "
     '{"type": "decision", "passed": true or false, "judgment": "one or two sentences"}. '
     "Use $? , stdout, and stderr only. Do not assume a file, process, or directory that is not shown there. "
     "Pass only when the statement's claim about $? , stdout, or stderr is visible in those values. "
     "A vague statement such as 'the background service is running' fails when those values do not show it. "
+    "Be suspicious of scripts that redirect stderr to /dev/null or use fallback commands (||). "
+    "If stderr shows 'command not found' for a tool the verification claims to use, fail the verification. "
+    "Understand script logic: if a script checks a condition and prints a specific message on success (e.g., 'if curl returns OK then echo HEALTH_OK'), "
+    "and stdout contains that success message, you can infer the condition was met. "
     "If the statement is about something those streams do not show, such as the content of a log file, return "
     '{"type": "verify", "script": "a bash script that prints the evidence", "judgment": "what this command checks"}. '
-    "The script runs in the same directory as the phase script. "
+    "The script runs in the same directory as the phase script (the work directory). "
+    "Use relative paths from the work directory to read files. For example, if a log file was created as 'service.log', use 'cat service.log'. "
+    "The work directory path is provided for reference. "
     "It must print the evidence on stdout. A failing command may exit non-zero."
 )
 
@@ -273,9 +280,13 @@ class ChatPageJudge:
         stderr: str,
         *,
         follow_up: bool = False,
+        script_result: str = "",
+        work_dir: str = "",
     ) -> CliCheck:
         """Decide a CLI check, or request one command that gathers the missing evidence."""
         system = _CLI_VERIFY_FOLLOWUP if follow_up else _CLI_VERIFY_SYSTEM
+        script_result_info = f"\n\nscript_result:\n{script_result}" if script_result else ""
+        work_dir_info = f"\n\nWork directory: {work_dir}" if work_dir else ""
         messages = [
             SystemMessage(content=system),
             HumanMessage(
@@ -284,6 +295,8 @@ class ChatPageJudge:
                     f"$?: {exit_code}\n\n"
                     f"stdout:\n{stdout}\n\n"
                     f"stderr:\n{stderr}\n"
+                    f"{script_result_info}"
+                    f"{work_dir_info}"
                 )
             ),
         ]
@@ -321,7 +334,7 @@ def _stderr_decision(content: str) -> dict:
     except json.JSONDecodeError:
         payload = _decision_payload(content)
     if not isinstance(payload, dict):
-        raise ValueError("stderr judgment was not valid JSON")
+        raise TypeError("stderr judgment was not valid JSON")
     return payload
 
 

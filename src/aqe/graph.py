@@ -1,6 +1,5 @@
 """Plan, preflight, route, execute, validate, and reflect."""
 
-import json
 import logging
 import subprocess
 from collections.abc import Callable
@@ -109,7 +108,7 @@ def _matrix(state: AgentState) -> list[TestStep]:
                 ]
             
             matrix.append(TestStep.model_validate(item))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             import traceback
             logger.error(f"Failed to validate TestStep: {exc}\n{traceback.format_exc()}")
             logger.error(f"Item data: {item}")
@@ -248,7 +247,7 @@ def route_node(state: AgentState, deps: GraphDeps) -> dict:
     index = state.get("current_step", 0)
     print(f"[DEBUG] Route node: current_step={index}, matrix length={len(matrix)}")
     if index >= len(matrix):
-        print(f"[DEBUG] Route node: current_step >= matrix length, finishing")
+        print("[DEBUG] Route node: current_step >= matrix length, finishing")
         return {"phase": "finish", "reason_code": None, "reason": None}
     views = _views(state)
     _set_status(views, index, "running", summary=None)
@@ -265,9 +264,21 @@ def route_node(state: AgentState, deps: GraphDeps) -> dict:
 
 
 def _execute(state: AgentState, deps: GraphDeps, kind: str) -> dict:
+    # Check for cancellation before executing the step
+    if deps.control.cancel_requested:
+        index = state.get("current_step", 0)
+        views = _views(state)
+        _set_status(views, index, "skipped", assertion_passed=None, summary="Step canceled by user")
+        return {
+            "phase": "finish",
+            "reason_code": "canceled",
+            "reason": "The run was canceled.",
+            "step_views": _store_views(views),
+        }
+    
     try:
         matrix = _matrix(state)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Handle validation errors: mark current step as ERROR and skip subsequent steps
         print(f"[DEBUG] _matrix validation failed: {e}")
         import traceback
@@ -385,20 +396,26 @@ def _cli_packet(question: str, exit_code: int, stdout: str, stderr: str) -> str:
 def _run_verify_script(work_dir: Path, script: str) -> tuple[int, str, str]:
     """Run the verification command the model requested, in the phase directory."""
     work_dir.mkdir(parents=True, exist_ok=True)
-    path = work_dir / "verify.sh"
-    path.write_text(script if script.endswith("\n") else f"{script}\n", encoding="utf-8")
+    logger.info(f"Running verification script in {work_dir}:\n{script}")
+    
     try:
+        # Execute the script directly with shell=True instead of writing to a file
         result = subprocess.run(
-            ["bash", str(path)],
+            script,
+            shell=True,
+            executable="/bin/bash",
             cwd=str(work_dir),
             capture_output=True,
             text=True,
             timeout=60,
             check=False,
         )
+        logger.info(f"Verification script result: exit_code={result.returncode}, stdout={result.stdout[:200]}, stderr={result.stderr[:200]}")
     except subprocess.TimeoutExpired:
+        logger.warning("Verification command timed out")
         return 124, "", "Verification command timed out"
     except OSError as exc:
+        logger.error(f"Verification command failed with OSError: {exc}")
         return 1, "", str(exc)
     return result.returncode, result.stdout, result.stderr
 
@@ -408,22 +425,30 @@ def _cli_verification(deps: GraphDeps, question: str, result: ActionResult, evid
     exit_code = _cli_exit_code(result, evidence)
     stdout = str(evidence.get("stdout") or "")
     stderr = str(evidence.get("stderr") or "")
+    script_result = str(evidence.get("script_result") or "")
+    work_dir_str = str(deps.work_dir) if deps.work_dir else ""
     judge = deps.judge
     if judge is None:
         judge = build_judge()
         deps.judge = judge
     if hasattr(judge, "judge_cli"):
-        check = judge.judge_cli(question, exit_code, stdout, stderr)
+        logger.info(f"CLI verification: question='{question[:100]}...', exit_code={exit_code}, stdout_len={len(stdout)}, stderr_len={len(stderr)}, work_dir={work_dir_str}")
+        check = judge.judge_cli(question, exit_code, stdout, stderr, script_result=script_result, work_dir=work_dir_str)
+        logger.info(f"Judge response: passed={check.passed}, has_script={bool(check.script.strip())}, judgment='{check.judgment[:100] if check.judgment else 'None'}...'")
         if check.script.strip():
             work = deps.work_dir
             if work is None:
+                logger.error("Verification script requested but no work directory available")
                 return Judgment(
                     passed=False,
                     judgment=check.judgment or "The verification command has no work directory.",
                 )
             code, out, err = _run_verify_script(Path(work), check.script)
-            check = judge.judge_cli(question, code, out, err, follow_up=True)
+            logger.info(f"Verification script executed: exit_code={code}, stdout_len={len(out)}, stderr_len={len(err)}")
+            check = judge.judge_cli(question, code, out, err, follow_up=True, work_dir=work_dir_str)
+            logger.info(f"Follow-up judgment: passed={check.passed}, judgment='{check.judgment[:100] if check.judgment else 'None'}...'")
         if check.passed is None:
+            logger.warning(f"Judge did not decide verification: {check.judgment}")
             return Judgment(passed=False, judgment=check.judgment or "The model did not decide the verification.")
         return Judgment(passed=check.passed, judgment=check.judgment)
     return _judged_or_unreadable(deps, question, _cli_packet(question, exit_code, stdout, stderr))
@@ -490,6 +515,19 @@ def _page_judgment(deps: GraphDeps, question: str, page_source: str) -> Judgment
 
 
 def validate_node(state: AgentState, deps: GraphDeps) -> dict:
+    # Check for cancellation before validation
+    if deps.control.cancel_requested:
+        matrix = _matrix(state)
+        index = state.get("current_step", 0)
+        views = _views(state)
+        _set_status(views, index, "skipped", assertion_passed=None, summary="Step canceled by user during validation")
+        return {
+            "phase": "finish",
+            "reason_code": "canceled",
+            "reason": "The run was canceled.",
+            "step_views": _store_views(views),
+        }
+    
     matrix = _matrix(state)
     index = state.get("current_step", 0)
     step = matrix[index]
@@ -753,7 +791,7 @@ def build_graph(deps: GraphDeps, publish: Callable[[AgentState], None] | None = 
                 if publish is not None:
                     publish({**state, **update})
                 return update
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 # Handle errors: mark current step as ERROR and skip subsequent steps
                 print(f"[DEBUG] Node {fn.__name__} failed with error: {e}")
                 import traceback
