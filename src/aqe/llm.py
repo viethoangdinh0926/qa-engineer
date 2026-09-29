@@ -210,14 +210,15 @@ _BASH_LOGGING = _section(
     "Prefix log messages with timestamps or log levels (e.g., '[INFO]', '[ERROR]').",
     'Example: \'echo "[INFO] Starting service on port $PORT"\' (stdout) or \'echo "[ERROR] Failed to connect to database" >&2\' (stderr).',
     "This makes stdout/stderr more informative for debugging test failures.",
-    "IMPORTANT: Suppress non-critical logs from package managers and system tools.",
-    "For apt, apt-get, pip, npm, and similar package installation commands, redirect output to suppress verbose logs:",
-    "- For apt/apt-get: add '-qq' and redirect stderr to /dev/null: 'apt-get install -y -qq package > /dev/null 2>&1'",
-    "- For pip: add '--quiet' or '-q' and redirect output: 'pip install --quiet package > /dev/null 2>&1'",
-    "- For npm: add '--silent' or '--quiet' and redirect output: 'npm install --silent package > /dev/null 2>&1'",
-    "- For other tools: use their respective quiet/silent flags and redirect output",
+    "CRITICAL: Suppress ALL output from package managers and system tools by redirecting to /dev/null.",
+    "For apt, apt-get, pip, npm, and similar package installation commands, ALWAYS redirect both stdout and stderr:",
+    "- For apt/apt-get: 'apt-get update -qq > /dev/null 2>&1' and 'apt-get install -y -qq package > /dev/null 2>&1'",
+    "- For pip: 'pip install --quiet package > /dev/null 2>&1' or 'pip install -q package > /dev/null 2>&1'",
+    "- For npm: 'npm install --silent package > /dev/null 2>&1' or 'npm install --quiet package > /dev/null 2>&1'",
+    "- NEVER use apt-get without '> /dev/null 2>&1' at the end",
+    "- The '> /dev/null 2>&1' MUST be added to EVERY package installation command",
     "Example: 'apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq python3 > /dev/null 2>&1'",
-    "This reduces noise in the output and makes logs more focused on the actual test operations.",
+    "This completely suppresses verbose package installation logs.",
 )
 
 _SCRIPT_LOGGING = _section(
@@ -1155,9 +1156,7 @@ def _coerce_phases(raw: list) -> tuple[list[TestPhase], str | None]:
                 interface = "CODING"
             elif driver_name == "browser" or actions:
                 interface = "GUI"
-            elif isinstance(script_value, str) and script_value.strip():
-                interface = "CLI"
-            elif notes or any(check.startswith(("json:", "status:")) for check in verifications):
+            elif (isinstance(script_value, str) and script_value.strip()) or notes or any(check.startswith(("json:", "status:")) for check in verifications):
                 interface = "CLI"
             else:
                 problems.append(
@@ -1991,22 +1990,22 @@ def _parse_plan(content: str) -> PlanResult:
 
     raw_steps = payload.get("steps")
     if not isinstance(raw_steps, list):
-        raise ValueError("The reply has no phases array.")
+        raise TypeError("The reply has no phases array.")
     logger.info("Processing steps instead of phases")
     try:
         payload["steps"] = _coerce_steps(raw_steps)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Step coercion failed: %s", exc)
-        raise ValueError("The reply is not a test plan.") from exc
+        raise TypeError("The reply is not a test plan.") from exc
     if "accepted" not in payload:
         payload["accepted"] = bool(payload["steps"])
     if reason_text:
         payload["reason"] = reason_text
     try:
         return PlanResult.model_validate(payload)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Plan validation failed: %s", exc)
-        raise ValueError("The reply is not a test plan.") from exc
+        raise TypeError("The reply is not a test plan.") from exc
 
 
 class ChatModelPlanner:
