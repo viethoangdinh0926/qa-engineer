@@ -39,6 +39,8 @@ help:
 	@echo "  make serve              Serve using HOST and PORT from .env"
 	@echo "  make serve-container     Serve from Ubuntu container with code volume mount"
 	@echo "  make stop-container      Stop and remove the service container"
+	@echo ""
+	@echo "Note: Containers use --restart=unless-stopped policy for auto-restart on crash or Docker restart"
 
 install: $(VENV)/.install
 
@@ -73,9 +75,11 @@ serve-container:
 	# Start service in Ubuntu container as root user for full privileges
 	# This allows automatic tool installation (curl, wget, jq, Python, etc.) when needed
 	# Using --network host to allow container to access host services via localhost
+	# Using --restart=unless-stopped to auto-restart on crash or Docker restart
 	@if [ "$(USE_HOST_PLAYWRIGHT_CACHE)" = "true" ]; then \
 		docker run -d --name aqe-service \
 			--network host \
+			--restart=unless-stopped \
 			-v $(PWD):/app \
 			-v $(PWD)/runs:/app/runs \
 			-v $(HOST_PLAYWRIGHT_CACHE):/root/.cache/ms-playwright \
@@ -96,6 +100,7 @@ serve-container:
 	else \
 		docker run -d --name aqe-service \
 			--network host \
+			--restart=unless-stopped \
 			-v $(PWD):/app \
 			-v $(PWD)/runs:/app/runs \
 			-e HOST=0.0.0.0 \
@@ -118,6 +123,7 @@ serve-container:
 	@echo "Service running on http://localhost:$(SERVICE_HOST_PORT)"
 	@echo "Container runs as root user for full privileges"
 	@echo "Container uses host networking (can access host services via localhost"
+	@echo "Container will auto-restart on crash or Docker restart (unless explicitly stopped)"
 	@if [ "$(USE_HOST_PLAYWRIGHT_CACHE)" = "true" ]; then \
 		echo "Using host Playwright cache from $(HOST_PLAYWRIGHT_CACHE)"; \
 	else \
