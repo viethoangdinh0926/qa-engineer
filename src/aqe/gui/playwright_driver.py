@@ -86,7 +86,7 @@ class PlaywrightDriver:
             raise HarnessError("browser_launch_failed", "Playwright is not installed.") from exc
         try:
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=True)
+            self._browser = self._playwright.chromium.launch(headless=True, ignore_https_errors=True)
             self._page = self._browser.new_page()
         except Exception as exc:
             self.close()
